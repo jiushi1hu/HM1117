@@ -232,6 +232,40 @@ class CounterfactualCreditWorkflowTest(unittest.TestCase):
                 self.assertEqual(row['actor_reward_sources'], ['system_reward']*5)
                 self.assertEqual(row['critic_reward_layout'], 'shared_team')
 
+    def test_context_inputs_survive_training_and_replay_without_daily_limits(self):
+        for terminal in (False, True):
+            with self.subTest(terminal_storage=terminal), tempfile.TemporaryDirectory() as directory, \
+                    redirect_stdout(io.StringIO()):
+                physical = dict(self.physical, use_daily_level_limits=False,
+                                terminal_storage_equal_initial=terminal)
+                args = copy.deepcopy(self.args)
+                args['algo']['happo_credit_assignment'] = 'counterfactual'
+                data = CascadeData(ROOT/'data/cascade_reservoir_new', physical, args['experiment'])
+                runner = CascadeReservoirRunner(data, physical, args, 1,
+                    periodic_windows=select_periodic_windows(data, episode_days=3),
+                    checkpoint_dir=Path(directory))
+                self.addCleanup(runner.close)
+                runner.run(2)
+                self.assertEqual(runner.actor_buffer[0].obs.shape, (4, 2, 14))
+                self.assertEqual(runner.critic_buffer.share_obs.shape, (4, 2, 33))
+                self.assertTrue(np.isfinite(runner.counterfactual_advantages).all())
+                if terminal:
+                    target = runner.counterfactual_context['terminal_target']
+                    expected = ((target-data.vmin)/(data.vmax-data.vmin)).astype(np.float32)
+                    np.testing.assert_array_equal(runner.critic_buffer.share_obs[:-1, :, -10:-5], expected)
+                    volume = runner.counterfactual_context['terminal_future_external_volume_m3']
+                    self.assertTrue(np.isfinite(volume).all())
+                    self.assertTrue((volume >= 0.).all())
+                    np.testing.assert_array_equal(volume[-1], np.zeros((2, 5)))
+                else:
+                    np.testing.assert_array_equal(runner.critic_buffer.share_obs[:-1, :, -10:], 0.)
+                policy = load_checkpoint(Path(directory)/'update_000001.pt')
+                self.assertEqual(policy.metadata['observation']['actor_observation_size'], 14)
+                self.assertEqual(policy.metadata['observation']['critic_state_size'], 33)
+                result = policy.replay([1965])
+                self.assertTrue(np.isfinite(result['episode_system_reward']))
+                self.assertEqual(result['episode_horizon_days'], 3)
+
     def test_compressed_trace_preserves_exact_frozen_credit_before_updates(self):
         from harl.envs.cascade_reservoir.counterfactual_logging import (
             CounterfactualCreditWriter, COUNTERFACTUAL_TRACE_FIELDS)

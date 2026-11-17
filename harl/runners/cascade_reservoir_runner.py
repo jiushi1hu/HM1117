@@ -13,7 +13,7 @@ from harl.common.buffers.on_policy_critic_buffer_ep import OnPolicyCriticBufferE
 from harl.common.valuenorm import ValueNorm
 from harl.envs.cascade_reservoir.episodes import episode_environment, positive_integer, training_windows
 from harl.envs.cascade_reservoir.parallel_env import ParallelCascadeEnvs
-from harl.envs.cascade_reservoir.evaluation import evaluate_policy
+from harl.envs.cascade_reservoir.evaluation import evaluate_policy, episode_constraint_status
 from harl.envs.cascade_reservoir.periodic_evaluation import (
     evaluate_periodic_policy, select_periodic_windows)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
@@ -75,7 +75,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     def __init__(self, data, physical_config, algo_args, seed, episode_log=None, step_log=None,
                  periodic_windows=None, training_sampler=None,
-                 trajectory_log=None, checkpoint_dir=None, counterfactual_log=None):
+                 trajectory_log=None, checkpoint_dir=None, counterfactual_log=None,
+                 correctness_enabled=False):
         seed = validate_seed(seed)
         self.data, self.physical_config = data, physical_config
         self.requested_args = copy.deepcopy(algo_args)
@@ -166,6 +167,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.training_history, self.episode_history, self.diagnostics_history = [], [], []
         self.periodic_evaluation_history = []
         self.episode_log = episode_log
+        self.verbose_console = args['experiment'].get('verbose_console', False)
+        if not isinstance(self.verbose_console, bool):
+            raise ValueError('verbose_console must be a boolean')
         self.step_log = step_log
         self.trajectory_log = trajectory_log
         self.checkpoint_dir = None if checkpoint_dir is None else Path(checkpoint_dir)
@@ -176,9 +180,38 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         if self.checkpoint_interval and self.checkpoint_dir is None:
             raise ValueError('checkpoint_interval requires checkpoint output')
         self.checkpoint_history = []
-        self.diagnostics_enabled = bool(args['experiment'].get('diagnostics', False) or trajectory_log is not None)
+        if not isinstance(correctness_enabled, bool):
+            raise ValueError('correctness_enabled must be a boolean')
+        if correctness_enabled and self.algorithm_name != 'happo':
+            raise ValueError('The HAPPO correctness figures require the HAPPO runner')
+        self.correctness_enabled = correctness_enabled
+        self.correctness_update_history = []
+        self.correctness_trajectory = None
+        self.correctness_final_update = None
+        self.diagnostics_enabled = bool(args['experiment'].get('diagnostics', False) or
+                                        trajectory_log is not None or correctness_enabled)
         self.parallel_envs = None
         self.worker_pids = []
+
+    def _log_record(self, record):
+        log_episode(record, self.episode_log, console=getattr(self, 'verbose_console', False))
+
+    def _progress_return(self, record=None):
+        """Display the actual learning objective rather than legacy accounting."""
+        if record is None:
+            if self.critic_reward_layout == 'shared_team':
+                return self.last_reward_metrics.get('episode_system_reward')
+            rewards = [row['learning_rewards']['episode_mixed_rewards']
+                       for row in self.episode_history[-self.n_envs:]]
+            return float(np.mean(rewards)) if rewards else None
+        if self.critic_reward_layout == 'shared_team':
+            return record.get('system_evaluator_return', record.get('episode_system_reward'))
+        values = record.get('mixed_evaluator_returns', record.get('episode_mixed_rewards'))
+        return None if values is None else float(np.mean(values))
+
+    @staticmethod
+    def _progress_number(value, precision=6):
+        return 'unavailable' if value is None else format(value, '.'+str(precision)+'f')
 
     def _create_actors(self, network_args, env):
         """Keep the original five independent HAPPO networks by default."""
@@ -301,6 +334,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     shape[:2], dtype=np.int64)
                 self.counterfactual_context['terminal_forecast'] = np.empty(
                     shape[:2]+(self.num_agents,), dtype=np.float64)
+                self.counterfactual_context['terminal_future_external_volume_m3'] = np.empty(
+                    shape[:2]+(self.num_agents,), dtype=np.float64)
             self.counterfactual_probabilities = np.empty(shape+(self.action_bins,), dtype=np.float32)
         if self.trajectory_log is not None:
             self.trajectory_log.begin_batch(seed=self.seed, update=self.update_count+1,
@@ -346,6 +381,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                             [row['terminal_remaining_days'] for row in transitions])
                         context['terminal_forecast'][t] = np.stack(
                             [row['terminal_forecast'] for row in transitions])
+                        context['terminal_future_external_volume_m3'][t] = np.stack(
+                            [row['terminal_future_external_volume_m3'] for row in transitions])
                 if self.trajectory_log is not None:
                     self.trajectory_log.capture(t, transitions)
                 done = np.array([r['done'] for r in results])
@@ -373,12 +410,11 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 record.update(failed_episodes_so_far=self.hard_failed_episodes,
                     hard_constraint_failure_rate_so_far=self.hard_failed_episodes/self.episode_attempts)
                 self._annotate_learning_rewards(record)
-                log_episode(record, self.episode_log)
-            log_episode(dict(record_type='training_sampling_aborted', seed=self.seed,
+                self._log_record(record)
+            self._log_record(dict(record_type='training_sampling_aborted', seed=self.seed,
                 attempted_window_starts=years, cause=str(exc),
                 completed_training_coverage=self.training_coverage_summary(),
-                coverage_scope='successfully collected full batches only; this failed batch is excluded'),
-                self.episode_log)
+                coverage_scope='successfully collected full batches only; this failed batch is excluded'))
             self.close()
             raise
         metrics = []
@@ -392,7 +428,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 ppo_epochs_max=self.requested_args['algo']['ppo_epoch'])
             self._annotate_learning_rewards(record)
             self.episode_history.append(record)
-            log_episode(record, self.episode_log)
+            self._log_record(record)
             metrics.append(result['reward_metrics'])
         self.sampled_window_starts.extend(years)
         self.last_reward_metrics = {
@@ -445,9 +481,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.last_rollout.update(counterfactual_seconds=credit['summary']['computation_seconds'],
             counterfactual_raw_advantage_mean=float(credit['raw_advantages'].mean()),
             counterfactual_advantage_scale=float(credit['advantage_scale']))
-        log_episode(dict(record_type='counterfactual_credit', seed=self.seed,
+        self._log_record(dict(record_type='counterfactual_credit', seed=self.seed,
             update=self.update_count+1, training_steps=self.collected_training_steps,
-            **credit['summary']), self.episode_log)
+            **credit['summary']))
         if self.counterfactual_log is not None:
             self.counterfactual_log.write_batch(self)
 
@@ -463,9 +499,13 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         if self.training_sampler.episodes != episodes:
             self.training_sampler = self._make_training_sampler(episodes)
         updates = episodes//self.n_envs
+        self.correctness_final_update = updates
+        self._console_total_updates = updates
+        self._console_log_interval = log_interval
+        print('seed={} phase=training-start episodes=0/{} updates=0/{}'.format(
+            self.seed, episodes, updates), flush=True)
         try:
-            log_episode(dict(self.training_sampler.metadata(), record_type='training_sampling_plan'),
-                        self.episode_log)
+            self._log_record(dict(self.training_sampler.metadata(), record_type='training_sampling_plan'))
             self.periodic_evaluation()
             for k in range(1, updates+1):
                 if self.algo_args['train']['use_linear_lr_decay']:
@@ -484,8 +524,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 if self.trajectory_log is not None:
                     trajectory_summary = self.trajectory_log.write_batch(self, diagnostic_before,
                         {i: buffer.factor for i, buffer in enumerate(self.actor_buffer)})
-                    log_episode(dict(trajectory_summary, record_type='trajectory_diagnostics',
-                                     seed=self.seed, update=self.update_count), self.episode_log)
+                    self._log_record(dict(trajectory_summary, record_type='trajectory_diagnostics',
+                                     seed=self.seed, update=self.update_count))
                 row = dict(seed=self.seed, update=self.update_count, training_steps=self.training_steps,
                     elapsed_seconds=time.monotonic()-self.started, **self.last_rollout, **self.last_reward_metrics)
                 for i, info in enumerate(actor_info):
@@ -495,7 +535,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     raise FloatingPointError('Non-finite training diagnostics')
                 self.training_history.append(row)
                 optimization_keys = ('optimizer_steps','ratio_samples','ppo_epochs_completed')
-                log_episode(dict(record_type='training_update', seed=self.seed, update=self.update_count,
+                self._log_record(dict(record_type='training_update', seed=self.seed, update=self.update_count,
                     episode=self.completed_episodes, training_steps=self.training_steps,
                     window_start_years=self.batch_window_starts, source_years_by_episode=self.batch_source_years,
                     episode_lengths=self.batch_episode_lengths, episode_horizon_days=self.length,
@@ -503,7 +543,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     actor_optimization=[{key:float(info[key]) for key in optimization_keys if key in info}
                         for info in actor_info], episode_reward_mean=self.last_reward_metrics['episode_reward'],
                     episode_generation_TWh_mean=self.last_rollout['episode_energy_TWh'],
-                    training_sampling_coverage=self.training_coverage_summary()),self.episode_log)
+                    training_sampling_coverage=self.training_coverage_summary()))
                 if self.diagnostics_enabled:
                     from harl.envs.cascade_reservoir.diagnostics import after_update, print_update_window
                     report = after_update(self, diagnostic_before)
@@ -513,13 +553,19 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                             if key.startswith(('clipped_surrogate_','unclipped_surrogate_',
                                                'weighted_entropy_','regularized_objective_'))}
                     self.diagnostics_history.append(report)
-                    log_episode(dict(report,record_type='training_diagnostics',seed=self.seed),self.episode_log)
-                    if k % log_interval == 0 or k == updates:
+                    if self.correctness_enabled:
+                        evidence = copy.deepcopy(self.last_correctness_happo)
+                        evidence['learning_metrics'] = copy.deepcopy(report['actors'])
+                        self.correctness_update_history.append(evidence)
+                        self._log_record(dict(evidence, record_type='correctness_happo_update', seed=self.seed))
+                    self._log_record(dict(report,record_type='training_diagnostics',seed=self.seed))
+                    if self.verbose_console and (k % log_interval == 0 or k == updates):
                         print_update_window(self,min(log_interval,k))
-                elif k % log_interval == 0 or k == updates:
-                    print('seed={} update={}/{} episodes={} steps={} return={:.6f} generation={:.3f} TWh'.format(
-                        self.seed,k,updates,self.completed_episodes,self.training_steps,
-                        self.last_reward_metrics['episode_reward'],self.last_rollout['episode_energy_TWh']),flush=True)
+                if k % log_interval == 0 or k == updates:
+                    print('seed={} phase=training update={}/{} episodes={}/{} steps={} return={} generation={:.3f} TWh elapsed={:.0f}s'.format(
+                        self.seed,k,updates,self.completed_episodes,episodes,self.training_steps,
+                        self._progress_number(self._progress_return()),
+                        self.last_rollout['episode_energy_TWh'],time.monotonic()-self.started),flush=True)
                 if k % self.eval_interval == 0 or k == updates:
                     self.periodic_evaluation()
                 if self.checkpoint_dir is not None and (k == updates or
@@ -529,7 +575,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     checkpoint = save_checkpoint(self,
                         self.checkpoint_dir / ('update_{:06d}.pt'.format(self.update_count)))
                     self.checkpoint_history.append(checkpoint)
-                    log_episode(dict(checkpoint, record_type='policy_checkpoint'), self.episode_log)
+                    self._log_record(dict(checkpoint, record_type='policy_checkpoint'))
+            print('seed={} phase=training-complete episodes={}/{} updates={}/{}'.format(
+                self.seed, self.completed_episodes, episodes, self.update_count, updates), flush=True)
             return dict(seed=self.seed, updates_completed=self.update_count, **self.evaluation_policy_metadata())
         finally:
             self.close()
@@ -540,12 +588,39 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         if (self.periodic_evaluation_history and
                 self.periodic_evaluation_history[-1]['evaluation_round'] == self.update_count):
             raise RuntimeError('This policy update has already been evaluated')
+        options = {}
+        recorder = selected = None
+        if self.correctness_enabled and self.update_count == self.correctness_final_update:
+            from harl.envs.cascade_reservoir.correctness_diagnostics import CorrectnessRecorder
+            selected = self.periodic_windows[1]
+            recorder = CorrectnessRecorder(self.data, self.physical_config, self.seed,
+                max_steps=selected['episode_horizon_days'])
+            recorder.begin_episode(self.completed_episodes, selected['source_years'])
+            options['transition_observers'] = {selected['window_id']: recorder.capture}
         record = evaluate_periodic_policy(self.actor, self.data, self.physical_config,
             seed=self.seed, evaluation_round=self.update_count, training_steps=self.training_steps,
-            windows=self.periodic_windows, gamma=self.algo_args['algo']['gamma'])
+            windows=self.periodic_windows, gamma=self.algo_args['algo']['gamma'], **options)
+        if recorder is not None:
+            evidence = recorder.finish()
+            result = next(window for window in record['windows'] if window['window_id'] == selected['window_id'])
+            evidence.update(phase='training_evaluation', scenario_id=selected['window_id'],
+                policy_update=self.update_count, expected_steps=selected['episode_horizon_days'],
+                status=result['status'])
+            self.correctness_trajectory = evidence
         self._annotate_learning_rewards(record)
         self.periodic_evaluation_history.append(record)
-        log_episode(record, self.episode_log)
+        self._log_record(record)
+        total = getattr(self, '_console_total_updates', self.update_count)
+        interval = getattr(self, '_console_log_interval', 1)
+        if self.update_count == 0 or self.update_count == total or self.update_count % interval == 0:
+            ecology = record.get('ecological_flow_violation_rate')
+            print('seed={} phase=evaluation update={}/{} windows={}/{} return={} terminal_pass={}/{} ecological_violation={}'.format(
+                self.seed, self.update_count, total,
+                record.get('completed_window_count', record.get('successful_window_count', 0)),
+                record.get('window_count', len(self.periodic_windows)),
+                self._progress_number(self._progress_return(record)),
+                record.get('terminal_pass_window_count', 0), record.get('terminal_required_window_count', 0),
+                'unavailable' if ecology is None else '{:.2f}%'.format(100.*ecology)), flush=True)
         return record
 
     def evaluation_policy_metadata(self):
@@ -560,6 +635,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         metadata = self.evaluation_policy_metadata()
         years = list(self.data.evaluation_years)
         modes = [actor.actor.training for actor in self.actor]
+        print('seed={} phase=held-out-evaluation status=running'.format(self.seed), flush=True)
         try:
             with torch.random.fork_rng(devices=[]):
                 row = evaluate_policy(self.actor,self.data,self.physical_config,seed=self.seed,
@@ -568,16 +644,18 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     step_log=self.step_log)
         except InfeasibleCascade as exc:
             progress = getattr(exc, 'evaluation_progress', {})
-            log_episode(self._annotate_learning_rewards(dict(record_type='final_evaluation_sequence', phase='evaluation',
+            self._log_record(self._annotate_learning_rewards(dict(record_type='final_evaluation_sequence', phase='evaluation',
                 seed=self.seed, episode=self.completed_episodes, training_steps=self.training_steps,
                 evaluation_source_years=years, episode_horizon_days=self.length,
-                status='failed', feasible=False, gamma=self.algo_args['algo']['gamma'],
+                status='failed', gamma=self.algo_args['algo']['gamma'],
+                **episode_constraint_status(completed=False, physical_feasible=False,
+                    terminal_enabled=self.physical_config.get('terminal_storage_equal_initial', False)),
                 failure=dict(error_type=type(exc).__name__, reason=str(exc),
                     date=progress.get('date', str(years[0])+'-01-01'),
                     episode_step=progress.get('episode_step', 1),
                     completed_steps=progress.get('completed_steps', 0)),
                 partial_metrics=progress.get('partial_metrics', {}),
-                episode_reward=None, energy_MWh=None, energy_TWh=None, **metadata)), self.episode_log)
+                episode_reward=None, energy_MWh=None, energy_TWh=None, **metadata)))
             raise  # Preserve the existing final-evaluation stop-on-failure behavior.
         finally:
             for actor,mode in zip(self.actor,modes):
@@ -586,5 +664,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                    source_year_labels=[label for year,label in zip(years,self.data.evaluation_labels)
                                        if year in row['source_years']])
         self._annotate_learning_rewards(row)
-        log_episode(row,self.episode_log)
+        self._log_record(row)
+        terminal = row.get('terminal_met')
+        print('seed={} phase=held-out-evaluation status=completed return={} terminal={}'.format(
+            self.seed, self._progress_number(self._progress_return(row)),
+            'met' if terminal is True else 'missed' if terminal is False else 'not-applicable'), flush=True)
         return [row]

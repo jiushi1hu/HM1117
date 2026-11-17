@@ -17,7 +17,8 @@ import torch
 from harl.common.valuenorm import ValueNorm
 from harl.envs.cascade_reservoir.data_loader import CascadeData, IDS
 from harl.envs.cascade_reservoir.episodes import episode_environment, positive_integer
-from harl.envs.cascade_reservoir.evaluation import DailyLimitMetrics, _attach_evaluation_progress
+from harl.envs.cascade_reservoir.evaluation import (
+    DailyLimitMetrics, _attach_evaluation_progress, episode_constraint_status)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.reward import (
     EpisodeRewardMetrics, SYSTEM_REWARD_DEFINITION, reward_metadata, validate_discount_factor)
@@ -535,6 +536,10 @@ class FrozenCascadePolicy:
         used_years = list(dict.fromkeys(d.year for d in env.data.dates))
         totals = metrics.summary(detailed=True)
         totals.update(reward_metadata(self.data))
+        totals.update(episode_constraint_status(completed=True, physical_feasible=True,
+            terminal_enabled=env.terminal_storage_equal_initial,
+            terminal_objective=getattr(env, 'terminal_report', None),
+            service_shortfalls=totals['service_shortfalls']))
         totals['mixed_reward_definition'] = totals['actor_reward_definition']
         team = self.critic_reward_layout == 'shared_team'
         if team:
@@ -556,7 +561,7 @@ class FrozenCascadePolicy:
             initial_storage_m3=initial.tolist(), final_storage_m3=env.storage.tolist(),
             total_storage_depletion_billion_m3=float((initial-env.storage).sum()/1e9),
             max_balance_residual_m3=residual, terminal_objective=getattr(env, 'terminal_report', None),
-            **feasible, **env.observation_metadata(),
+            **{key:value for key,value in feasible.items() if key not in totals}, **env.observation_metadata(),
             **totals,
             reward_penalties=dict(env.reward_settings),
             action_overrides=[dict(episode_step=int(step), reservoir=name, action_index=int(index))

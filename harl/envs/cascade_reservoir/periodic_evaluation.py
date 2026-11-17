@@ -8,7 +8,7 @@ import torch
 
 from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.episodes import positive_integer, training_windows
-from harl.envs.cascade_reservoir.evaluation import evaluate_policy
+from harl.envs.cascade_reservoir.evaluation import evaluate_policy, episode_constraint_status
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.reward import REWARD_AGGREGATION, validate_discount_factor
 
@@ -135,7 +135,7 @@ def _preserve_training_state(actors):
 
 
 def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_round,
-                             training_steps, windows, gamma):
+                             training_steps, windows, gamma, transition_observers=None):
     """Measure a frozen policy on all three scenarios without changing training.
 
     Each scenario gets a newly reset environment and deterministic argmax
@@ -152,16 +152,23 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
         raise ValueError('training_steps must be a nonnegative integer')
     gamma = validate_discount_factor(gamma)
     scenarios = _validated_windows(data, windows)
+    observers = {} if transition_observers is None else transition_observers
+    if (not isinstance(observers, dict) or
+            set(observers)-{window['window_id'] for window in scenarios} or
+            any(not callable(observer) for observer in observers.values())):
+        raise ValueError('transition_observers must map known window IDs to callables')
     individual = []
     with _preserve_training_state(actors):
         for window in scenarios:
             result = dict(window, seed=int(seed), evaluation_round=int(evaluation_round),
                           status='ok', failure=None)
             try:
+                options = ({'transition_observer': observers[window['window_id']]}
+                           if window['window_id'] in observers else {})
                 measured = evaluate_policy(actors, data, physical_config, seed=int(seed),
                     episode=int(evaluation_round), training_steps=int(training_steps),
                     gamma=gamma, source_years=window['source_years'],
-                    episode_days=window['episode_horizon_days'], deterministic=True)
+                    episode_days=window['episode_horizon_days'], deterministic=True, **options)
             except InfeasibleCascade as exc:
                 progress = getattr(exc, 'evaluation_progress', {})
                 result.update(status='failed', failure=dict(error_type=type(exc).__name__,
@@ -173,6 +180,8 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
                 result.update({metric:None for metric in
                                _SCALAR_METRICS+_VECTOR_METRICS+_VIOLATION_METRICS})
                 result['service_shortfalls'] = None
+                result.update(episode_constraint_status(completed=False, physical_feasible=False,
+                    terminal_enabled=physical_config.get('terminal_storage_equal_initial', False)))
             else:
                 final_storage = [measured[name+'_end_m3'] for name in IDS]
                 result.update(evaluator_return=measured['episode_reward'],
@@ -187,14 +196,24 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
                     completed_steps=window['episode_horizon_days'],
                     violation_count=measured['violation_count'],
                     max_daily_bound_excess_m3=measured['max_daily_bound_excess_m3'],
+                    terminal_objective=measured.get('terminal_objective'),
                     service_shortfalls=measured['service_shortfalls'])
                 result.update(_violation_metrics(measured['service_shortfalls']))
+                result.update(episode_constraint_status(completed=True, physical_feasible=True,
+                    terminal_enabled=physical_config.get('terminal_storage_equal_initial', False),
+                    terminal_objective=measured.get('terminal_objective'),
+                    service_shortfalls=measured['service_shortfalls']))
             individual.append(result)
     successes = sum(row['status'] == 'ok' for row in individual)
+    def all_measured(values):
+        values = list(values)
+        return False if any(value is False for value in values) else True if all(
+            value is True for value in values) else None
     record = dict(record_type='periodic_evaluation', phase='training_evaluation',
         seed=int(seed), evaluation_round=int(evaluation_round), training_steps=int(training_steps),
         status='ok' if successes == 3 else 'failed', window_count=3,
         successful_window_count=successes, gamma=gamma, deterministic=True,
+        successful_window_count_definition='legacy completion count; required_pass_window_count includes terminal equality',
         reservoir_ids=list(IDS), evaluator_return_aggregation=REWARD_AGGREGATION,
         scenario_aggregation='arithmetic mean over all three fixed windows; null when any window fails',
         violation_rate_definition='violating active reservoir-days / all active reservoir-days; '
@@ -203,9 +222,24 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
         violation_rate_aggregation='sum counts / sum active reservoir-days across all three complete windows; '
             'null when any window fails or the denominator is zero',
         windows=individual)
+    terminal_enabled = physical_config.get('terminal_storage_equal_initial', False)
+    record.update(completed=successes == 3, completed_window_count=successes,
+        physical_feasible=all_measured(row['physical_feasible'] for row in individual),
+        terminal_required_window_count=3 if terminal_enabled else 0,
+        terminal_measured_window_count=sum(row['terminal_met'] is not None for row in individual),
+        terminal_pass_window_count=sum(row['terminal_met'] is True for row in individual),
+        required_pass_window_count=sum(row['required_constraints_met'] is True for row in individual),
+        required_constraints_met=all_measured(row['required_constraints_met'] for row in individual),
+        terminal_met=(all_measured(row['terminal_met'] for row in individual) if terminal_enabled else None),
+        ecological_compliant=all_measured(row['ecological_compliant'] for row in individual),
+        constraint_status_definition='completion and raw returns cover all fixed scenarios; required constraints additionally include enabled terminal equality; ecology remains soft')
     for metric in _SCALAR_METRICS+_VECTOR_METRICS:
         record[metric] = (np.asarray([row[metric] for row in individual], dtype=np.float64).mean(axis=0).tolist()
                           if successes == 3 else None)
+    record.update(feasible=record['physical_feasible'],
+        feasible_definition='physical-only alias; use required_constraints_met for physical constraints plus enabled terminal equality')
+    for metric in ('evaluator_return', 'system_evaluator_return', 'mixed_evaluator_returns'):
+        record['constraint_qualified_'+metric] = (record[metric] if record['required_constraints_met'] is True else None)
     for term in _VIOLATION_TERMS:
         count_key, eligible_key = term+'_violation_count', term+'_active_reservoir_days'
         count = sum(row[count_key] for row in individual) if successes == 3 else None

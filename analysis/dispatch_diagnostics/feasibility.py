@@ -84,6 +84,8 @@ class _TransitionAnalysis:
                 terminal = dict(target=self.row['terminal_target'],
                     remaining_days=self.row['terminal_remaining_days'],
                     forecast=self.row['terminal_forecast'])
+                if 'terminal_future_external_volume_m3' in self.row:
+                    terminal['future_external_volume_m3'] = self.row['terminal_future_external_volume_m3']
             self.witnesses[key] = self.physics.transition(
                 self.row['storage_start'], self.row['external'], actions,
                 self.lower, self.upper, terminal=terminal)
@@ -137,8 +139,7 @@ class _TransitionAnalysis:
         low, high = float(self.row['low'][i]), float(self.row['high'][i])
         if low > high+1e-8 or low < -1e-8:
             raise ValueError('Invalid feasible release interval')
-        infeasible = self.row.get('terminal_window_infeasible')
-        forced = high-low <= 1e-8 or (infeasible is not None and bool(infeasible[i]))
+        forced = bool(np.asarray(self.row['controls'])[i] == 0.)
         releases = np.full(self.bins, actual) if forced else low+self.grid**2*(high-low)
         best = int(np.argmax(releases))
         witness = self.replay(i, float(self.grid[best]), float(releases[best]))

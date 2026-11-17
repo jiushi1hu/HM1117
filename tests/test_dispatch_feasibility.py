@@ -86,6 +86,8 @@ def brute_grid(env, row, reservoir):
     if row.get('terminal_target') is not None:
         terminal = dict(target=row['terminal_target'],
             remaining_days=row['terminal_remaining_days'], forecast=row['terminal_forecast'])
+        if 'terminal_future_external_volume_m3' in row:
+            terminal['future_external_volume_m3'] = row['terminal_future_external_volume_m3']
     results = []
     for index in range(env.action_bins):
         candidate = actions.copy()

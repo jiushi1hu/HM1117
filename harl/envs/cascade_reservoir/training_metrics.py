@@ -136,8 +136,14 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
     percentages = {k: 100.*v/power if power > 0. else None for k,v in costs.items()}
     percentages['total'] = 100.*sum(costs.values())/power if power > 0. else None
     requirements = getattr(env.data, 'service_requirements', None)
+    # Imported at call time: evaluation itself imports the compact step writer.
+    from harl.envs.cascade_reservoir.evaluation import episode_constraint_status
+    constraints = episode_constraint_status(completed=completed, physical_feasible=not failed,
+        terminal_enabled=getattr(env, 'terminal_storage_equal_initial', False),
+        terminal_objective=getattr(env, 'terminal_report', None),
+        service_shortfalls=rewards.shortfall_summary())
     return dict(record_type='training_episode', seed=int(seed), episode=int(episode),
-        window_start_year=int(env.data.dates[env.start].year), completed=completed,
+        window_start_year=int(env.data.dates[env.start].year), **constraints,
         source_years=list(dict.fromkeys(day.year for day in env.data.dates[env.start:env.stop])),
         episode_horizon_days=int(env.stop-env.start),
         start_date=env.data.dates[env.start].isoformat(),
@@ -161,14 +167,15 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
         **env.observation_metadata(),
         reward_penalties=dict(env.reward_settings), reference_energy_MWh=env.physics.reference_energy,
         terminal_objective=getattr(env, 'terminal_report', None),
-        release_bounds_scope=('rolling_forecast_terminal_window' if getattr(
+        release_bounds_scope=('cascade_prefix_forecast_budget' if getattr(
             env, 'terminal_storage_equal_initial', False) else 'current_transition'))
 
 
-def log_episode(record, stream=None):
-    """Always print JSON; optionally flush one JSONL record to an explicit file."""
+def log_episode(record, stream=None, *, console=False):
+    """Persist detailed JSON independently of the opt-in console echo."""
     encoded = json.dumps(record, allow_nan=False)
     if stream is not None:
         stream.write(encoded+'\n')
         stream.flush()
-    print('EPISODE_METRICS '+encoded, flush=True)
+    if console:
+        print('EPISODE_METRICS '+encoded, flush=True)

@@ -19,6 +19,7 @@ from harl.runners.cascade_reservoir_runner import (
 from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths,
     trajectory_diagnostics_paths, checkpoint_directories, counterfactual_credit_paths)
+from examples.train_cascade_parallel import validate_correctness_output
 
 
 def load_configuration():
@@ -37,7 +38,7 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     parser.add_argument('--parallel-envs',type=int,help='Independent worker environments (default: 6)')
     parser.add_argument('--window-sampling',choices=SAMPLING_MODES,
                         help='Training-window schedule: coverage_balanced (default) or legacy uniform sampling')
-    parser.add_argument('--log-interval',type=int,help='Print training diagnostics every N updates')
+    parser.add_argument('--log-interval',type=int,help='Print training progress every N updates')
     parser.add_argument('--eval-interval',type=int,
                         help='Evaluate fixed training scenarios every N updates (default: 1); also at round 0 and the last update')
     parser.add_argument('--evaluation-years',nargs='+',type=int,metavar='YEAR',
@@ -67,6 +68,8 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     parser.add_argument('--check-data-only',action='store_true',
                         help='Check data, episode calendars and observations without training')
     parser.add_argument('--diagnostics',action='store_true',help='Record learning signals on collected training episodes')
+    parser.add_argument('--verbose-console',action='store_true',
+                        help='Also print full configuration and JSON diagnostics; default console shows concise progress')
     parser.add_argument('--trajectory-diagnostics',action='store_true',
                         help='Link all five reservoirs daily physics to frozen own values/advantages; implies --diagnostics and requires --episode-log')
     parser.add_argument('--save-checkpoints',action='store_true',
@@ -79,6 +82,8 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     parser.add_argument('--plot-python',default=sys.executable,help='Python interpreter with interactive Matplotlib')
     parser.add_argument('--plot-output',type=Path,
                         help='Figure output stem: save _training.png, _evaluator_return.png and _violation_rates.png without requiring --episode-log')
+    parser.add_argument('--correctness-output',type=Path,
+                        help='New directory for evidence.json and six correctness figures; enables observational diagnostics and works with --no-plot')
     parser.add_argument('--no-plot',action='store_true',help='Run without opening plot windows')
     if parser_extension is not None:
         parser_extension(parser)
@@ -93,6 +98,10 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
         parser.error('--checkpoint-interval requires --save-checkpoints')
     if output_preflight is None and args.episode_log is not None and args.episode_log.exists():
         parser.error('episode-log must name a new file')
+    try:
+        validate_correctness_output(args.correctness_output)
+    except ValueError as exc:
+        parser.error(str(exc))
     config, physical = load_configuration()
     exp, train, model, algo = (config[key] for key in ('experiment','train','model','algo'))
     for name in ('episodes','log_interval','seeds','eval_interval','window_sampling'):
@@ -187,6 +196,7 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
                 if path.exists():
                     parser.error('Figure file already exists: '+str(path))
     exp['diagnostics'] = args.diagnostics or args.trajectory_diagnostics
+    exp['verbose_console'] = args.verbose_console
     exp['trajectory_diagnostics'] = args.trajectory_diagnostics
     exp['save_checkpoints'] = args.save_checkpoints
     exp['checkpoint_interval'] = args.checkpoint_interval

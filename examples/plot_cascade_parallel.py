@@ -11,6 +11,88 @@ VIOLATION_TERMS = ('ecological_flow',)
 VIOLATION_SUFFIXES = ('violation_rate', 'violation_count', 'active_reservoir_days')
 
 
+def learning_return_kind(payload):
+    """Resolve reward semantics from provenance, including historical HAPPO."""
+    objective = payload.get('learning_objective', {})
+    if not isinstance(objective, dict):
+        raise ValueError('learning_objective must be a mapping')
+    layout = objective.get('critic_reward_layout', payload.get('critic_reward_layout'))
+    if layout == 'shared_team':
+        return 'shared_team'
+    if layout == 'mixed_by_reservoir_then_legacy_team':
+        return 'individual_mixed'
+    source = objective.get('advantage_source')
+    if source in ('shared_team', 'counterfactual_shared_team'):
+        return 'shared_team'
+    if source == 'individual_mixed':
+        return 'individual_mixed'
+    if layout is not None or source is not None:
+        raise ValueError('Unsupported plotting learning objective')
+    return 'legacy_team'
+
+
+def learning_return_label(payload):
+    return {'shared_team': 'Shared-team system learning return',
+            'individual_mixed': 'Mean individual mixed learning return',
+            'legacy_team': 'Legacy-team return (learning objective unavailable)'}[learning_return_kind(payload)]
+
+
+def _finite_return(value, field):
+    if isinstance(value, bool) or np.ndim(value) != 0:
+        raise ValueError(field+' must be a finite scalar')
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(field+' must be a finite scalar') from exc
+    if not np.isfinite(result):
+        raise ValueError(field+' must be a finite scalar')
+    return result
+
+
+def _mixed_returns(value, field):
+    result = np.asarray(value, dtype=float)
+    if result.shape != (5,) or not np.isfinite(result).all():
+        raise ValueError(field+' must contain five finite reservoir returns')
+    return result
+
+
+def learning_return_value(payload, row, phase):
+    """Select the learned reward; never substitute legacy accounting for it."""
+    if phase not in ('training', 'evaluation'):
+        raise ValueError('Unknown return plotting phase: '+str(phase))
+    if phase == 'evaluation' and row.get('status') == 'failed':
+        return np.nan
+    kind = learning_return_kind(payload)
+    if kind == 'legacy_team':
+        field = 'episode_reward' if phase == 'training' else 'evaluator_return'
+    elif kind == 'shared_team':
+        field = 'episode_system_reward' if phase == 'training' else 'system_evaluator_return'
+    else:
+        field = 'episode_mixed_rewards' if phase == 'training' else 'mixed_evaluator_returns'
+        if field in row:
+            return float(_mixed_returns(row[field], field).mean())
+        if phase == 'training' and all(key in row for key in
+                ('episode_system_reward', 'episode_global_reward')):
+            # With five reservoirs and alpha=.5, sum(mixed)=system+2*global.
+            # The identity also holds for the lane-averaged in-memory history.
+            return (_finite_return(row['episode_system_reward'], 'episode_system_reward')+
+                    2.*_finite_return(row['episode_global_reward'], 'episode_global_reward'))/5.
+    if field not in row:
+        raise ValueError('Missing '+field+' for '+learning_return_label(payload)+
+                         '; learning returns cannot be reconstructed from legacy reward alone')
+    return _finite_return(row[field], field)
+
+
+def validate_learning_evaluation(payload, row):
+    """Check the selected round return against all three complete windows."""
+    if learning_return_kind(payload) == 'legacy_team':
+        return
+    value = learning_return_value(payload, row, 'evaluation')
+    windows = [learning_return_value(payload, window, 'evaluation') for window in row['windows']]
+    if row['status'] == 'ok' and not np.isclose(value, np.mean(windows), rtol=1e-10, atol=1e-10):
+        raise ValueError('Learning evaluator return must equal the mean of all three fixed windows')
+
+
 def positive_integer(value, name):
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
         raise ValueError(name+' must be a positive integer')
@@ -138,6 +220,8 @@ def load_episode_log(path):
     """Stream summary records, retaining collector and evaluator histories separately."""
     configuration, histories, updates = None, {}, {}
     evaluations, last_rounds, scenarios = {}, {}, None
+    pending_episodes = {}
+    pending_lanes = {}
     # Step writers put record_type first. Other key orders still use the JSON
     # parser below, so existing logs do not depend on object-key order.
     step_prefix = re.compile(r'^\s*\{\s*"record_type"\s*:\s*"(?:training_step|evaluation_step)"\s*[,}]')
@@ -162,7 +246,7 @@ def load_episode_log(path):
             if not isinstance(row, dict):
                 raise ValueError('Log records must be JSON objects at line {}'.format(line_number))
             kind = row.get('record_type')
-            if kind not in ('run_configuration', 'training_update', 'periodic_evaluation'):
+            if kind not in ('run_configuration', 'training_episode', 'training_update', 'periodic_evaluation'):
                 continue
             try:
                 if kind == 'run_configuration':
@@ -186,12 +270,35 @@ def load_episode_log(path):
                         scenarios = window_signature(periodic['windows'])
                     configuration['training_years'] = row.get('training_years')
                     configuration['evaluation_source_years'] = row.get('evaluation_source_years', [])
+                    for name in ('algorithm', 'algorithm_name', 'learning_objective',
+                                 'critic_reward_layout', 'actor_architecture'):
+                        if name in row:
+                            configuration[name] = row[name]
                     continue
                 if configuration is None:
                     raise ValueError('A run_configuration must precede training/evaluation results')
                 seed = row['seed']
                 if isinstance(seed, bool) or not isinstance(seed, int) or seed not in configuration['configured_seeds']:
                     raise ValueError('Result seed is absent from the run configuration')
+                if kind == 'training_episode':
+                    if not row.get('completed') or learning_return_kind(configuration) == 'legacy_team':
+                        continue
+                    update = positive_integer(row['collecting_for_update'], 'collecting_for_update')
+                    episode = positive_integer(row['episode'], 'episode')
+                    batch = pending_episodes.setdefault((seed, update), {})
+                    if episode in batch or update <= updates.get(seed, 0):
+                        raise ValueError('Duplicate or already plotted training episode')
+                    lane = row['parallel_env_index']
+                    lanes = pending_lanes.setdefault((seed, update), set())
+                    if (isinstance(lane, bool) or not isinstance(lane, int) or
+                            not 0 <= lane < configuration['parallel_envs'] or lane in lanes):
+                        raise ValueError('Completed training episodes must have distinct valid environment lanes')
+                    rewards = row['learning_rewards']
+                    # Validate the selected objective before retaining its data.
+                    learning_return_value(configuration, rewards, 'training')
+                    batch[episode] = rewards
+                    lanes.add(lane)
+                    continue
                 if kind == 'periodic_evaluation':
                     number = evaluation_round(row['evaluation_round'])
                     if seed not in last_rounds and number != 0:
@@ -201,6 +308,7 @@ def load_episode_log(path):
                     if number > configuration.get('updates_per_seed', number):
                         raise ValueError('Evaluation round exceeds the configured update budget')
                     signature = validate_periodic_row(row, scenarios)
+                    validate_learning_evaluation(configuration, row)
                     if scenarios is None:
                         scenarios = signature
                     training_years = configuration['training_years']
@@ -226,8 +334,23 @@ def load_episode_log(path):
                 generation = float(row['episode_generation_TWh_mean'])
                 if not np.isfinite([reward, generation]).all():
                     raise ValueError('Non-finite training curve metric')
-                history.append(dict(training_steps=step, episode_reward=reward,
-                                    episode_energy_TWh=generation))
+                point = dict(training_steps=step, episode_reward=reward, episode_energy_TWh=generation)
+                if learning_return_kind(configuration) != 'legacy_team':
+                    batch = pending_episodes.pop((seed, update), {})
+                    pending_lanes.pop((seed, update), None)
+                    if len(batch) != configuration['parallel_envs']:
+                        raise ValueError('Learning-return plot requires all completed training episodes for update '+str(update))
+                    rewards = list(batch.values())
+                    for field in ('episode_system_reward', 'episode_global_reward'):
+                        if all(field in episode for episode in rewards):
+                            point[field] = float(np.mean([_finite_return(episode[field], field)
+                                                         for episode in rewards]))
+                    if all('episode_mixed_rewards' in episode for episode in rewards):
+                        point['episode_mixed_rewards'] = np.mean([
+                            _mixed_returns(episode['episode_mixed_rewards'], 'episode_mixed_rewards')
+                            for episode in rewards], axis=0).tolist()
+                    learning_return_value(configuration, point, 'training')
+                history.append(point)
                 updates[seed] = update
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise ValueError('Invalid plotting input at line {}: {}'.format(line_number, exc)) from exc
@@ -270,15 +393,15 @@ def make_figure(payload):
     if not np.isfinite(gamma) or not 0 <= gamma <= 1:
         raise ValueError('Parallel curves require gamma in [0, 1]')
     days = positive_integer(payload['episode_horizon_days'], 'episode_horizon_days')
-    metrics = ('episode_reward', 'episode_energy_TWh')
-    values = [[np.asarray([r[metric] for r in rows], dtype=float) for rows in histories]
-              for metric in metrics]
+    values = [[np.asarray([learning_return_value(payload, r, 'training') for r in rows])
+               for rows in histories],
+              [np.asarray([r['episode_energy_TWh'] for r in rows], dtype=float) for rows in histories]]
     if not all(np.isfinite(row).all() for series in values for row in series):
         raise ValueError('Non-finite parallel curve metric')
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
     prefix = 'Mean collected episode'
     for ax, series, label in zip(axes, values,
-            (prefix+' net return (gamma={:g})'.format(gamma), prefix+' generation (TWh)')):
+            (learning_return_label(payload)+' (gamma={:g})'.format(gamma), prefix+' generation (TWh)')):
         if len(mean_grid):
             aligned = np.array([row[np.searchsorted(grid, mean_grid)] for grid, row in zip(grids, series)])
             mean = aligned.mean(axis=0)
@@ -313,6 +436,7 @@ def periodic_histories(payload):
             if row.get('seed') != seed:
                 raise ValueError('Periodic history seed disagrees with its curve')
             scenarios = validate_periodic_row(row, scenarios)
+            validate_learning_evaluation(payload, row)
         grids.append(grid)
     return seeds, histories, grids
 
@@ -357,12 +481,13 @@ def make_evaluator_figure(payload):
     """Plot the mean measured return and seed SD; failures remain gaps."""
     import matplotlib.pyplot as plt
     seeds, histories, grids = periodic_histories(payload)
-    values = [np.asarray([np.nan if row['evaluator_return'] is None else
-                          float(row['evaluator_return']) for row in rows]) for rows in histories]
+    values = [np.asarray([learning_return_value(payload, row, 'evaluation') for row in rows])
+              for rows in histories]
     fig, ax = plt.subplots(figsize=(9, 5.5), constrained_layout=True)
     plot_periodic_series(ax, payload, seeds, grids, values, 'Failed evaluation (no return)')
-    ax.set(ylabel='Evaluator return (mean of three fixed training windows)',
-           title='Evaluator Return vs. Evaluation Round')
+    title = 'Legacy Return' if learning_return_kind(payload) == 'legacy_team' else 'Learning Return'
+    ax.set(ylabel=learning_return_label(payload)+'\n(mean of three fixed training windows)',
+           title=title+' vs. Evaluation Round')
     return fig
 
 

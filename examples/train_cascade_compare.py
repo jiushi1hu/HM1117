@@ -17,7 +17,7 @@ from examples.train_cascade import main as cascade_main
 from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths,
     trajectory_diagnostics_paths, checkpoint_directories,
-    counterfactual_credit_paths)
+    counterfactual_credit_paths, validate_correctness_output)
 from examples.plot_cascade_compare import validate_comparison
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 from harl.runners.cascade_mappo_runner import CascadeMAPPORunner
@@ -55,6 +55,8 @@ def validate_algorithms(algorithms):
 def comparison_preflight(args, config):
     """Check every requested output and unsupported setting before any training."""
     algorithms = validate_algorithms(args.algorithms)
+    if getattr(args, 'correctness_output', None) is not None and 'mappo' in algorithms:
+        raise ValueError('The six correctness figures require HAPPO; select --algorithms happo')
     counterfactual = config['algo'].get('happo_credit_assignment','team_gae') == 'counterfactual'
     if counterfactual and 'mappo' in algorithms:
         raise ValueError('Counterfactual credit is a HAPPO-only variant; select --algorithms happo')
@@ -72,6 +74,7 @@ def comparison_preflight(args, config):
         paths.extend(counterfactual_credit_paths(log, seeds, counterfactual).values())
     if not args.no_plot:
         paths.extend(plot_output_paths(args.episode_log, getattr(args, 'plot_output', None)).values())
+    validate_correctness_output(getattr(args, 'correctness_output', None), paths)
     resolved = [path.resolve() for path in paths]
     if len(set(resolved)) != len(resolved):
         raise ValueError('Comparison output paths must be distinct')
@@ -85,7 +88,8 @@ def run_comparison(data, physical, config, args):
     comparison_preflight(args, config)
     if not args.no_plot and not args.check_data_only:
         subprocess.run([args.plot_python, str(ROOT/'examples/plot_cascade.py'),
-                        '--check-backend'], check=True)
+                        '--check-backend'], check=True,
+                       stdout=None if config['experiment'].get('verbose_console', False) else subprocess.DEVNULL)
     runs = []
     for algorithm in validate_algorithms(args.algorithms):
         options = copy.copy(args)
@@ -114,7 +118,8 @@ def run_comparison(data, physical, config, args):
                 '--evaluator-output', str(figures['evaluator']),
                 '--violations-output', str(figures['violations'])])
         subprocess.run(command, input=json.dumps(comparison, allow_nan=False),
-                       text=True, check=True)
+                       text=True, check=True,
+                       stdout=None if config['experiment'].get('verbose_console', False) else subprocess.DEVNULL)
     return comparison
 
 

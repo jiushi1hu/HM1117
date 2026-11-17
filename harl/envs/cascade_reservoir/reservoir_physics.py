@@ -1,19 +1,15 @@
 """Water balance, chain feasibility and a non-anticipative terminal schedule.
 
-The terminal-storage objective is enforced with a rolling release window built
-only from information available at the decision time: current storage, today's
-realised inflow, the remaining number of decisions, the terminal target and the
-supplied next-seven-day mean inflow forecast. No future observed inflow is read.
+Joint terminal release windows use prefix water budgets and supplied future
+external volumes. These forecast conditions do not certify future-envelope
+reachability. An inconsistent nonfinal plan preserves physically available
+actor control; an unreachable final target uses a deterministic safe projection.
+No future observed inflow is read and storage is never repaired.
 """
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import HEAD_MODELS
-
-
-class InfeasibleCascade(RuntimeError):
-    pass
-
-
-TERMINAL_TOLERANCE = 1e-8
+from harl.envs.cascade_reservoir.dispatch_kernel import (
+    InfeasibleCascade, TERMINAL_TOLERANCE, dispatch_release)
 
 
 def terminal_inputs(terminal):
@@ -37,13 +33,11 @@ def terminal_inputs(terminal):
 
 
 def terminal_release_window(dt, storage, inflow, target, remaining_days, forecast, capacity):
-    """Today's release window that keeps the terminal target attainable.
+    """Legacy budget arithmetic for one outlet, not a reachability certificate.
 
-    Reaching the target after the remaining decisions requires a total release
-    volume of V + dt*inflow + dt*(days-1)*forecast - target. Only the part that
-    can still be released over the remaining days may be deferred, which gives
-    the window [required - (days-1)*capacity, required]. On the final day the
-    window collapses to the exact release required by the water balance.
+    For a cascade outlet, storage, target and external forcing must all be
+    prefix sums. Live scalar and batch dispatch instead use the shared kernel,
+    including an explicitly supplied future external volume when available.
     """
     future = (int(remaining_days)-1 if np.ndim(remaining_days) == 0 else
               np.asarray(remaining_days, dtype=np.int64)-1)
@@ -157,12 +151,11 @@ class ReservoirPhysics:
                    terminal=None):
         """Apply one action using only information available at decision time.
 
-        Bounds constrain storage after this action. Optional terminal scheduling
-        inputs (target, remaining decisions and the supplied seven-day inflow
-        forecast) shrink each release interval so the terminal target stays
-        attainable. The final decision collapses to the exact water-balance
-        release. An empty intersection executes the nearest admissible release
-        and is reported; storage is never overwritten to satisfy the target.
+        End-state bounds remain hard. Optional prefix terminal budgets enter a
+        joint backward compatibility pass before any actor release is resolved.
+        A rejected nonfinal forecast plan leaves physical actor choices intact.
+        An unreachable final target uses a command-independent safe projection;
+        its realised deviation remains explicit in the resulting water balance.
         """
         storage, external, actions = [np.asarray(x, dtype=np.float64) for x in (storage, external, actions)]
         if any(x.shape != (5,) or not np.isfinite(x).all() for x in (storage, external, actions)):
@@ -173,47 +166,15 @@ class ReservoirPhysics:
         storage_min, storage_max = self._storage_bounds(storage_lower, storage_upper)
         if ((storage < d.vmin - 1) | (storage > d.vmax + 1)).any():
             raise InfeasibleCascade("Starting storage violates operating bounds")
-        lower, upper = self.downstream_intervals(storage, external, storage_min, storage_max)
-        inflow, release, low, high = [np.empty(5) for _ in range(4)]
-        controls, executed_actions = np.ones(5, dtype=np.float32), actions.copy()
-        target = days = forecast = None
-        window_low, window_high = np.full(5, -np.inf), np.full(5, np.inf)
-        binding, infeasible = np.zeros(5, dtype=bool), np.zeros(5, dtype=bool)
-        reason = np.zeros(5, dtype=np.int8)
-        if terminal is not None:
-            target, days, forecast = terminal_inputs(terminal)
-        for i in range(5):
-            inflow[i] = external[i] + (release[i - 1] if i else 0.)
-            low[i] = max(lower[i], inflow[i] + (storage[i] - storage_max[i]) / self.dt)
-            high[i] = min(upper[i], inflow[i] + (storage[i] - storage_min[i]) / self.dt)
-            if low[i] > high[i] + 1e-8:
-                raise InfeasibleCascade("Empty feasible release interval at reservoir " + str(i))
-            if terminal is not None:
-                window_low[i], window_high[i] = terminal_release_window(
-                    self.dt, storage[i], inflow[i], target[i], days, forecast[i],
-                    d.release_cap[i])
-                planned_low = max(low[i], window_low[i])
-                planned_high = min(high[i], window_high[i])
-                if planned_low > planned_high + TERMINAL_TOLERANCE:
-                    infeasible[i] = True
-                    reason[i] = 1 if window_low[i] > high[i] + TERMINAL_TOLERANCE else 2
-                    release[i] = float(np.clip(0.5 * (window_low[i] + window_high[i]),
-                                               low[i], high[i]))
-                    controls[i] = 0
-                    executed_actions[i] = 0.5
-                    continue
-                binding[i] = (planned_low > low[i] + TERMINAL_TOLERANCE or
-                              planned_high < high[i] - TERMINAL_TOLERANCE)
-                low[i], high[i] = planned_low, planned_high
-            if high[i] - low[i] <= 1e-8:
-                controls[i] = 0
-                executed_actions[i] = 0.5
-                # A tolerance-sized interval inversion can put the midpoint
-                # just outside [0, outlet capacity]. Bound the actual flow;
-                # storage is still computed from it and checked below.
-                release[i] = min(d.release_cap[i], max(0., 0.5 * (low[i] + high[i])))
-            else:
-                release[i] = low[i] + executed_actions[i] ** 2 * (high[i] - low[i])
+        dispatched = dispatch_release(storage[None], external[None], actions[None],
+            storage_min[None], storage_max[None], d.release_cap, self.dt, terminal)
+        def unbatch(value):
+            if isinstance(value, dict):
+                return {key:unbatch(item) for key, item in value.items()}
+            item = value[0]
+            return item.copy() if isinstance(item, np.ndarray) else item.item()
+        dispatch = {key:unbatch(value) for key, value in dispatched.items()}
+        inflow, release = dispatch['inflow'], dispatch['release']
         next_storage = storage + (inflow - release) * self.dt
         residual = next_storage - storage - (inflow - release) * self.dt
         tolerance = np.maximum(1., 1e-10 * np.abs(storage))
@@ -228,18 +189,10 @@ class ReservoirPhysics:
         system_residual = next_storage.sum() - storage.sum() - (external.sum() - release[-1]) * self.dt
         if abs(system_residual) > tolerance.sum():
             raise AssertionError("Cascade water conservation failed")
-        result = dict(storage_start=storage.copy(), storage_end=next_storage, inflow=inflow,
-                    external=external.copy(), actions=executed_actions, release=release,
-                    low=low, high=high, controls=controls, residual=residual,
+        result = dict(storage_start=storage.copy(), storage_end=next_storage,
+                    external=external.copy(), residual=residual,
                     reward=float(energy.sum() / self.reference_energy),
-                    system_residual=float(system_residual), **generated)
+                    system_residual=float(system_residual), **dispatch, **generated)
         if storage_lower is not None:
             result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
-        if terminal is not None:
-            result.update(terminal_target=target.copy(), terminal_remaining_days=days,
-                terminal_forecast=forecast.copy(), terminal_window_low_m3s=window_low.copy(),
-                terminal_window_high_m3s=window_high.copy(), terminal_window_binding=binding.copy(),
-                terminal_window_infeasible=infeasible.copy(), terminal_window_reason=reason.copy(),
-                terminal=dict(target=target.copy(), remaining_days=days,
-                              forecast=forecast.copy()))
         return result

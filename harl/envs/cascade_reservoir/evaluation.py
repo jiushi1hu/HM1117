@@ -10,6 +10,37 @@ from harl.envs.cascade_reservoir.reward import (
     EpisodeRewardMetrics, validate_discount_factor, REWARD_AGGREGATION, reward_metadata)
 
 
+def episode_constraint_status(*, completed, physical_feasible, terminal_enabled,
+                              terminal_objective=None, service_shortfalls=None):
+    """Separate execution, physical constraints, terminal equality and soft ecology.
+
+    Unknown or incomplete terminal/service measurements remain null. ``feasible``
+    is retained as a physical-only compatibility alias; policy eligibility must
+    use ``required_constraints_met`` rather than completion or that alias.
+    """
+    terminal = None
+    if completed and terminal_enabled and isinstance(terminal_objective, dict):
+        measured = terminal_objective.get('met')
+        if isinstance(measured, (bool, np.bool_)):
+            terminal = bool(measured)
+    ecology = None
+    if completed and isinstance(service_shortfalls, dict):
+        measured = service_shortfalls.get('ecological_flow')
+        if isinstance(measured, dict) and measured.get('active_reservoir_days', 0) > 0:
+            ecology = measured['reservoir_day_count'] == 0
+    if not completed or physical_feasible is False or (terminal_enabled and terminal is False):
+        required = False
+    elif physical_feasible is None or (terminal_enabled and terminal is None):
+        required = None
+    else:
+        required = True
+    return dict(completed=bool(completed), physical_feasible=physical_feasible,
+        terminal_met=terminal, ecological_compliant=ecology,
+        required_constraints_met=required, feasible=physical_feasible,
+        feasible_definition='physical-only alias of physical_feasible; terminal equality is included in required_constraints_met',
+        constraint_status_definition='required constraints: physical feasibility and enabled terminal equality; ecological flow remains a soft service objective')
+
+
 class DailyLimitMetrics:
     """Check executed next-state storage against the action date's daily limits."""
 
@@ -35,7 +66,9 @@ class DailyLimitMetrics:
         if self.violations:
             raise InfeasibleCascade('Evaluation trajectory violates daily next-state storage limits')
         return dict(daily_level_limits=env.level_limits is not None, action_bins=env.action_bins,
-            feasible=True, violation_count=self.violations,
+            physical_feasible=True, feasible=True,
+            feasible_definition='physical-only alias; excludes the separate terminal-storage objective',
+            violation_count=self.violations,
             max_daily_bound_excess_m3=self.max_bound_excess)
 
 
@@ -63,7 +96,8 @@ def _attach_evaluation_progress(error, env, rewards, energy):
 @torch.no_grad()
 def evaluate_policy(actors, data, physical_config, seed, episode, training_steps, *,
                     gamma, source_years, episode_days=DEFAULT_EPISODE_DAYS,
-                    deterministic=True, diagnostics=False, step_log=None):
+                    deterministic=True, diagnostics=False, step_log=None,
+                    transition_observer=None):
     """Evaluate one complete multi-year sequence without collecting training samples.
 
     Evaluation years are used only after training. A training-only diagnostic
@@ -71,6 +105,8 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
     Source dates and daily level limits are preserved at representative-year joins.
     """
     gamma = validate_discount_factor(gamma)
+    if transition_observer is not None and not callable(transition_observer):
+        raise ValueError('transition_observer must be callable')
     if len(actors) != len(IDS):
         raise ValueError('Evaluation requires one actor per reservoir')
     bins = actors[0].args.get('action_bins', DEFAULT_ACTION_BINS)
@@ -103,6 +139,8 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
             _attach_evaluation_progress(exc, env, reward_metrics, energy)
             raise
         row = env.last_transition
+        if transition_observer is not None:
+            transition_observer(row)
         if step_log is not None:
             log_step(step_record(row, seed=seed, episode=episode,
                 episode_step=env.index-env.start, phase=phase,
@@ -142,6 +180,9 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
         raise
     result.update(reward_metrics.summary(detailed=True), **reward_metadata(data),
         reward_penalties=env.reward_settings, reward_aggregation=REWARD_AGGREGATION)
+    result.update(episode_constraint_status(completed=True, physical_feasible=True,
+        terminal_enabled=env.terminal_storage_equal_initial,
+        terminal_objective=result['terminal_objective'], service_shortfalls=result['service_shortfalls']))
     if diagnostics:
         result.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
             spill_by_reservoir_billion_m3=(spill_by_reservoir/1e9).tolist(),

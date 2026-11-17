@@ -98,6 +98,15 @@ def use_current_learning_objectives(data):
             network_count=5, optimizer_count=5, raw_observation_dim=15,
             network_observation_dim=15, identity_features='implicit_in_separate_actor',
             critic_output_dim=1 if team else 6)
+        for rows in entry['payload']['histories']:
+            for row in rows:
+                row.update(episode_system_reward=2*row['episode_reward'],
+                           episode_mixed_rewards=[3*row['episode_reward']]*5)
+        for rows in entry['payload']['evaluation_histories']:
+            for row in rows:
+                for scope in [row]+row['windows']:
+                    scope.update(system_evaluator_return=2*scope['evaluator_return'],
+                                 mixed_evaluator_returns=[3*scope['evaluator_return']]*5)
     return data
 
 
@@ -110,7 +119,9 @@ class ComparisonFigureTest(unittest.TestCase):
         figures = compare.make_figures(use_current_learning_objectives(payload()))
         for figure in figures.values():
             self.assertIn('Different learning objectives', figure._suptitle.get_text())
-        np.testing.assert_allclose(figures['training'].axes[0].lines[0].get_ydata(), [3.5, 5.5])
+        np.testing.assert_allclose(figures['training'].axes[0].lines[0].get_ydata(), [7., 11.])
+        np.testing.assert_allclose(figures['training'].axes[0].lines[1].get_ydata(), [310.5, 316.5])
+        np.testing.assert_allclose(figures['training'].axes[1].lines[0].get_ydata(), [16., 17.])
         np.testing.assert_allclose(figures['violations'].axes[0].lines[1].get_ydata(), [15., 15., 15.])
 
     def test_joint_figures_keep_seeds_within_algorithm(self):
@@ -198,6 +209,93 @@ def write_log(path, algorithm, inline_context, labeled=True):
 
 
 class ComparisonIdentityTest(unittest.TestCase):
+    def versioned_payload(self, daily_limits=True, sharing=True):
+        data = use_current_learning_objectives(payload())
+        for entry in data['runs']:
+            run = entry['payload']
+            context = run['comparison_context']
+            context['shared_settings']['physical_config']['use_daily_level_limits'] = daily_limits
+            context['data_hashes'][compare.FORECAST_INPUT] = 'f'*64
+            shared = sharing and entry['algorithm'] == 'mappo'
+            context['shared_settings']['algo']['share_param'] = shared
+            raw_dim = 18 if daily_limits else 14
+            run['actor_architecture'].update(parameter_sharing=shared,
+                network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
+                raw_observation_dim=raw_dim,
+                network_observation_dim=raw_dim+5 if shared else raw_dim,
+                identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor',
+                actor_observation_layout=compare.ACTOR_OBSERVATION_LAYOUT,
+                critic_state_layout=compare.CRITIC_STATE_LAYOUT,
+                critic_state_size=53 if daily_limits else 33)
+        return data
+
+    def test_current_versioned_actor_and_critic_layouts_accept_both_limit_modes_and_sharing(self):
+        for daily_limits in (False, True):
+            for sharing in (False, True):
+                with self.subTest(daily_limits=daily_limits, sharing=sharing):
+                    compare.validate_comparison(self.versioned_payload(daily_limits, sharing))
+
+    def test_current_layout_rejects_unknown_versions_and_mismatched_dimensions(self):
+        for field, value, message in (
+                ('actor_observation_layout', 'unsupported_actor_v99', 'actor observation layout'),
+                ('critic_state_layout', 'unsupported_critic_v99', 'critic state layout'),
+                ('critic_state_size', 38, 'Critic state size'),
+                ('raw_observation_dim', 16, 'dimensions/counts'),
+                ('network_observation_dim', 21, 'dimensions/counts')):
+            with self.subTest(field=field):
+                data = self.versioned_payload()
+                data['runs'][1]['payload']['actor_architecture'][field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    compare.validate_comparison(data)
+
+    def test_current_layout_requires_complete_version_metadata_and_forecast_hash(self):
+        for field in ('actor_observation_layout', 'critic_state_layout', 'critic_state_size'):
+            with self.subTest(field=field):
+                data = self.versioned_payload()
+                del data['runs'][0]['payload']['actor_architecture'][field]
+                with self.assertRaisesRegex(ValueError, 'layout|state size'):
+                    compare.validate_comparison(data)
+        data = self.versioned_payload()
+        for entry in data['runs']:
+            del entry['payload']['comparison_context']['data_hashes'][compare.FORECAST_INPUT]
+        with self.assertRaisesRegex(ValueError, 'forecast input hash'):
+            compare.validate_comparison(data)
+
+    def test_explicit_previous_forecast_layout_keeps_historical_dimensions(self):
+        for daily_limits in (False, True):
+            with self.subTest(daily_limits=daily_limits):
+                data = self.versioned_payload(daily_limits)
+                for entry in data['runs']:
+                    architecture = entry['payload']['actor_architecture']
+                    architecture['actor_observation_layout'] = compare.PREVIOUS_ACTOR_OBSERVATION_LAYOUT
+                    architecture.pop('critic_state_layout')
+                    architecture['critic_state_size'] -= 15
+                    architecture['raw_observation_dim'] -= 2
+                    architecture['network_observation_dim'] -= 2
+                compare.validate_comparison(data)
+
+    def test_previous_target_layout_retains_its_original_dimensions(self):
+        for daily_limits in (False, True):
+            data = self.versioned_payload(daily_limits)
+            for entry in data['runs']:
+                architecture = entry['payload']['actor_architecture']
+                architecture['actor_observation_layout'] = compare.TARGET_ACTOR_OBSERVATION_LAYOUT
+                architecture['critic_state_layout'] = compare.TARGET_CRITIC_STATE_LAYOUT
+                architecture['critic_state_size'] -= 5
+                architecture['raw_observation_dim'] -= 1
+                architecture['network_observation_dim'] -= 1
+            compare.validate_comparison(data)
+
+    def test_comparison_rejects_new_and_historical_observation_layouts_on_same_data(self):
+        data = self.versioned_payload()
+        architecture = data['runs'][1]['payload']['actor_architecture']
+        for field in ('actor_observation_layout', 'critic_state_layout', 'critic_state_size'):
+            architecture.pop(field)
+        architecture['raw_observation_dim'] -= 2
+        architecture['network_observation_dim'] -= 2
+        with self.assertRaisesRegex(ValueError, 'observation layouts differ'):
+            compare.validate_comparison(data)
+
     def test_forecast_input_hash_identifies_current_and_legacy_actor_dimensions(self):
         for forecast, daily_limits, sharing in ((forecast, daily, sharing)
                 for forecast in (False, True) for daily in (False, True)

@@ -76,7 +76,11 @@ class TerminalScheduleTest(unittest.TestCase):
             self.assertTrue(np.all(row['release'] >= -1e-8))
             self.assertTrue(np.all(row['release'] <= self.data.release_cap+1e-8))
             self.assertTrue(np.all(np.isin(row['controls'], (0., 1.))))
-            self.assertTrue(np.all(row['terminal_window_infeasible'] <= (row['controls'] == 0.)))
+            if row['terminal_plan_rejected']:
+                self.assertTrue(np.any(row['terminal_window_infeasible']))
+            if row['terminal_fallback']:
+                self.assertTrue(np.all(row['controls'] == 0.))
+                self.assertEqual(row['terminal_remaining_days'], 1)
 
     def test_terminal_deviation_is_reported_without_overwriting_storage(self):
         feasible = episode_environment(self.data, self.physical, [1965], days=1,

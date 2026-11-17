@@ -5,6 +5,28 @@ from harl.utils.trans_tools import _t2n
 from harl.runners.on_policy_base_runner import OnPolicyBaseRunner
 
 
+def _correctness_statistics(values):
+    """Keep only bounded summaries, including explicit empty controllable sets."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if not values.size:
+        return dict(count=0, min=None, median=None, p95=None, max=None)
+    return dict(count=int(values.size), min=float(values.min()),
+                median=float(np.median(values)), p95=float(np.percentile(values, 95)),
+                max=float(values.max()))
+
+
+@torch.no_grad()
+def _correctness_distribution(actor, buffer):
+    """Reconstruct full categorical log probabilities in a separate float64 path.
+
+    The independent HAPPO actor is still its collection policy when this is
+    called before its update. This observer neither samples nor advances Adam.
+    """
+    distribution = actor.rollout_distribution(buffer)
+    return torch.log_softmax(distribution.logits.detach().to(dtype=torch.float64),
+                             dim=-1).cpu().numpy()
+
+
 class OnPolicyHARunner(OnPolicyBaseRunner):
     """Runner for on-policy HA algorithms."""
 
@@ -51,10 +73,29 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
             agent_order = list(range(self.num_agents))
         else:
             agent_order = list(torch.randperm(self.num_agents).numpy())
-        for agent_id in agent_order:
+        correctness = getattr(self, 'correctness_enabled', False)
+        if correctness:
+            correctness_actors = []
+            prefix_log_ratio = np.zeros(factor.shape, dtype=np.float64)
+        for position, agent_id in enumerate(agent_order):
             self.actor_buffer[agent_id].update_factor(
                 factor
             )  # current actor save factor
+            if correctness:
+                buffer = self.actor_buffer[agent_id]
+                old_distribution_logp = _correctness_distribution(self.actor[agent_id], buffer)
+                # Read the actual saved actor-entry F, not the local product
+                # variable that the implementation will multiply below.
+                used_factor = np.asarray(buffer.factor, dtype=np.float64)
+                expected_factor = np.exp(prefix_log_ratio)
+                error = np.abs(used_factor-expected_factor)
+                correctness_actor = dict(agent_id=int(agent_id), update_position=position,
+                    rows=int(used_factor.size),
+                    used_factor=_correctness_statistics(used_factor),
+                    expected_factor=_correctness_statistics(expected_factor),
+                    factor_max_abs_error=float(error.max()),
+                    factor_max_relative_error=float((error/np.maximum(
+                        np.abs(expected_factor), np.finfo(np.float64).tiny)).max()))
 
             # the following reshaping combines the first two dimensions (i.e. episode_length and n_rollout_threads) to form a batch
             available_actions = (
@@ -122,6 +163,37 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
                 )
             if not np.isfinite(completed_ratio).all():
                 raise FloatingPointError("Non-finite HAPPO importance ratio")
+            if correctness:
+                new_distribution_logp = _correctness_distribution(self.actor[agent_id], buffer)
+                commands = buffer.actions.reshape(-1).astype(np.int64)
+                rows = np.arange(commands.size)
+                independent_log_ratio = (new_distribution_logp[rows, commands]-
+                                         old_distribution_logp[rows, commands]).reshape(factor.shape)
+                active = buffer.active_masks[:-1] > 0.
+                # Forced placeholders do not have a collection likelihood.
+                # Marginalize their unused command as a unit factor instead.
+                masked_log_ratio = np.where(active, independent_log_ratio, 0.)
+                prefix_log_ratio += masked_log_ratio
+                old_probability = np.exp(old_distribution_logp)
+                new_probability = np.exp(new_distribution_logp)
+                kl = np.sum(old_probability*(old_distribution_logp-new_distribution_logp), axis=-1)
+                entropy = -np.sum(new_probability*new_distribution_logp, axis=-1)
+                selected = active.reshape(-1)
+                forced = completed_ratio[~active]
+                retained_ratio = np.exp(independent_log_ratio[active])
+                correctness_actor.update(controllable_rows=int(active.sum()),
+                    forced_rows=int((~active).sum()),
+                    final_sampled_ratio=_correctness_statistics(retained_ratio),
+                    final_masked_ratio=_correctness_statistics(np.exp(masked_log_ratio)),
+                    forced_factor_ratio_max_abs_error=(float(np.abs(forced-1.).max())
+                                                       if forced.size else 0.),
+                    final_policy_kl=(float(np.maximum(kl[selected], 0.).mean()) if selected.any() else None),
+                    final_clip_fraction=(float(np.mean(
+                        (retained_ratio < 1.-self.actor[agent_id].clip_param) |
+                        (retained_ratio > 1.+self.actor[agent_id].clip_param)))
+                        if retained_ratio.size else None),
+                    final_entropy=(float(entropy[selected].mean()) if selected.any() else None))
+                correctness_actors.append(correctness_actor)
             factor = factor * completed_ratio
             if not np.isfinite(factor).all():
                 raise FloatingPointError("Non-finite accumulated HAPPO factor")
@@ -136,5 +208,12 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
         critic_train_info = self.critic.train(
             self.critic_buffer, self.value_normalizer, update_normalizer_once=True
         )
+
+        if correctness:
+            self.last_correctness_happo = dict(update=getattr(self, 'update_count', 0)+1,
+                agent_order=[int(agent_id) for agent_id in agent_order],
+                factor_oracle='float64 exp(sum of independently reconstructed masked categorical log ratios)',
+                ratio_scope='final post-update / collection likelihood on controllable sampled commands',
+                actors=correctness_actors)
 
         return actor_train_infos, critic_train_info

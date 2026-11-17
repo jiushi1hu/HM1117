@@ -15,6 +15,14 @@ from examples import plot_cascade_parallel as legacy
 
 SCHEMA = 'cascade_comparison_v1'
 COLORS = {'happo': '#c0392b', 'mappo': '#2563eb'}
+# Serialized layout versions are kept here so plotting does not import Gym,
+# PyTorch or the simulator in a separate Matplotlib-only interpreter.
+ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_terminal_target_next7d_forecast_future_volume_v5'
+TARGET_ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_terminal_target_next7d_forecast_v4'
+PREVIOUS_ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_next7d_forecast_v3'
+CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_forecasts_targets_future_volumes_v2'
+TARGET_CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_terminal_targets_v1'
+FORECAST_INPUT = 'five_reservoir_next7d_mean_inflow_forecast_1965_2024.csv'
 SHARED_FIELDS = (
     'episode_horizon_days', 'parallel_environments', 'episodes_per_seed',
     'gamma', 'action_bins', 'seeds', 'training_years', 'evaluation_source_years',
@@ -119,6 +127,39 @@ def _context(payload):
     return _normalized_context(context), expected_signature
 
 
+def _observation_dimensions(run):
+    """Validate explicit layouts, retaining the dimensions of unversioned logs."""
+    architecture = run.get('actor_architecture') or {}
+    daily_limits = run['comparison_context']['shared_settings']['physical_config'].get(
+        'use_daily_level_limits', True)
+    has_forecast = FORECAST_INPUT in run['comparison_context']['data_hashes']
+    actor_layout = architecture.get('actor_observation_layout')
+    critic_layout = architecture.get('critic_state_layout')
+    state_size = 38 if daily_limits else 18
+    raw_dim = 15 if daily_limits else 11
+    if actor_layout in (ACTOR_OBSERVATION_LAYOUT, TARGET_ACTOR_OBSERVATION_LAYOUT):
+        if not has_forecast:
+            raise ValueError('The current actor observation layout requires the inflow forecast input hash')
+        current = actor_layout == ACTOR_OBSERVATION_LAYOUT
+        raw_dim += 3 if current else 2
+        state_size += 15 if current else 10
+        if critic_layout != (CRITIC_STATE_LAYOUT if current else TARGET_CRITIC_STATE_LAYOUT):
+            raise ValueError('Current actor observation layout requires the matching critic state layout')
+        if architecture.get('critic_state_size') != state_size:
+            raise ValueError('Critic state size does not match its observation layout')
+    else:
+        if actor_layout not in (None, PREVIOUS_ACTOR_OBSERVATION_LAYOUT):
+            raise ValueError('Unsupported actor observation layout: '+str(actor_layout))
+        if actor_layout == PREVIOUS_ACTOR_OBSERVATION_LAYOUT and not has_forecast:
+            raise ValueError('The forecast actor observation layout requires the inflow forecast input hash')
+        raw_dim += int(has_forecast)
+        if critic_layout is not None:
+            raise ValueError('Unsupported critic state layout for historical actor observations')
+        if 'critic_state_size' in architecture and architecture['critic_state_size'] != state_size:
+            raise ValueError('Historical critic state size does not match the cascade observations')
+    return raw_dim, state_size
+
+
 def _validate_architecture(algorithm, run):
     """Accept legacy independent actors or explicit ID-conditioned shared MAPPO."""
     settings = run['comparison_context']['shared_settings']
@@ -161,9 +202,7 @@ def _validate_architecture(algorithm, run):
         raise ValueError('Only MAPPO may use an ID-conditioned shared actor')
     if requested is not None and requested != shared:
         raise ValueError('Actor architecture disagrees with share_param')
-    raw_dim = 15 if settings['physical_config'].get('use_daily_level_limits', True) else 11
-    if 'five_reservoir_next7d_mean_inflow_forecast_1965_2024.csv' in run['comparison_context']['data_hashes']:
-        raw_dim += 1
+    raw_dim, _ = _observation_dimensions(run)
     expected = dict(network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
         raw_observation_dim=raw_dim, network_observation_dim=raw_dim+5 if shared else raw_dim,
         identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor',
@@ -179,7 +218,7 @@ def validate_comparison(payload):
     runs = payload.get('runs')
     if not isinstance(runs, list) or not runs:
         raise ValueError('Comparison requires at least one algorithm run')
-    normalized, names, reference = [], set(), None
+    normalized, names, reference, observation_reference = [], set(), None, None
     for entry in runs:
         if not isinstance(entry, dict) or not isinstance(entry.get('algorithm'), str):
             raise ValueError('Every run requires an algorithm name and legacy payload')
@@ -194,6 +233,10 @@ def validate_comparison(payload):
             raise ValueError('Algorithm label disagrees with its plotting payload')
         context, signature = _context(run)
         _validate_architecture(algorithm, run)
+        observation_dimensions = _observation_dimensions(run)
+        if observation_reference is not None and observation_dimensions != observation_reference:
+            raise ValueError('Comparison actor/critic observation layouts differ between algorithms')
+        observation_reference = observation_dimensions
         identity = _canonical(context)
         if reference is not None and identity != reference:
             raise ValueError('Comparison settings or input data_hashes differ between algorithms')
@@ -206,6 +249,8 @@ def validate_comparison(payload):
             if any(not np.isfinite(float(r[key])) for r in rows
                    for key in ('episode_reward', 'episode_energy_TWh')):
                 raise ValueError('Training curve metrics must be finite')
+            for row in rows:
+                legacy.learning_return_value(run, row, 'training')
         _, histories, _ = legacy.periodic_histories(run)
         for rows in histories:
             for row in rows:
@@ -253,23 +298,26 @@ def load_comparison(happo_log=None, mappo_log=None):
     return validate_comparison(dict(schema=SCHEMA, runs=runs))
 
 
-def _label(algorithm, count, run):
+def _label(algorithm, count, run, return_curve=False):
     total = len(run['comparison_context']['shared_settings']['seeds'])
     method = algorithm.upper()
     if run['comparison_context']['shared_settings'].get('algo',{}).get('happo_credit_assignment') == 'counterfactual':
         method += ' counterfactual'
-    return method+(' mean' if count == total else
-                              ' available-seed mean (n={})'.format(count))
+    label = method+(' mean' if count == total else
+                   ' available-seed mean (n={})'.format(count))
+    if return_curve:
+        label += ' ('+legacy.learning_return_label(run).lower()+')'
+    return label
 
 
-def _line_and_band(ax, grid, aligned, algorithm, run):
+def _line_and_band(ax, grid, aligned, algorithm, run, return_curve=False):
     valid = np.isfinite(aligned).all(axis=0)
     mean = np.full(len(grid), np.nan)
     mean[valid] = aligned[:, valid].mean(axis=0)
     color = COLORS[algorithm]
     ax.plot(grid, mean, color=color, lw=2,
             linestyle='-' if algorithm == 'happo' else '--',
-            label=_label(algorithm, len(aligned), run))
+            label=_label(algorithm, len(aligned), run, return_curve))
     if len(aligned) > 1:
         sd = np.full(len(grid), np.nan)
         sd[valid] = aligned[:, valid].std(axis=0, ddof=1)
@@ -285,9 +333,10 @@ def _training(ax, algorithm, run, metric):
     for rows in histories[1:]:
         common.intersection_update(r['training_steps'] for r in rows)
     grid = np.array(sorted(common), dtype=float)
-    aligned = np.array([[{r['training_steps']: r[metric] for r in rows}[step]
+    aligned = np.array([[{r['training_steps']: (legacy.learning_return_value(run, r, 'training')
+                                             if metric == 'learning_return' else r[metric]) for r in rows}[step]
                          for step in grid] for rows in histories], dtype=float)
-    _line_and_band(ax, grid, aligned, algorithm, run)
+    _line_and_band(ax, grid, aligned, algorithm, run, metric == 'learning_return')
 
 
 def _periodic(ax, algorithm, run, metric, percent=False):
@@ -296,9 +345,10 @@ def _periodic(ax, algorithm, run, metric, percent=False):
     aligned = np.full((len(seeds), len(grid)), np.nan)
     for i, (rounds, rows) in enumerate(zip(grids, histories)):
         aligned[i, np.searchsorted(grid, rounds)] = [
+            legacy.learning_return_value(run, row, 'evaluation') if metric == 'learning_return' else
             np.nan if row[metric] is None else float(row[metric])*(100. if percent else 1.)
             for row in rows]
-    _line_and_band(ax, grid, aligned, algorithm, run)
+    _line_and_band(ax, grid, aligned, algorithm, run, metric == 'learning_return')
     missing = ~np.isfinite(aligned).all(axis=0)
     if missing.any():
         y = .025 if algorithm == 'happo' else .055
@@ -318,19 +368,24 @@ def make_figures(payload):
     violation_axes = (violation_ax,)
     for entry in payload['runs']:
         algorithm, run = entry['algorithm'], entry['payload']
-        for ax, metric in zip(training_axes, ('episode_reward', 'episode_energy_TWh')):
+        for ax, metric in zip(training_axes, ('learning_return', 'episode_energy_TWh')):
             _training(ax, algorithm, run, metric)
-        _periodic(evaluator_ax, algorithm, run, 'evaluator_return')
+        _periodic(evaluator_ax, algorithm, run, 'learning_return')
         for ax, term in zip(violation_axes, legacy.VIOLATION_TERMS):
             _periodic(ax, algorithm, run, term+'_violation_rate', percent=True)
     shared = payload['runs'][0]['payload']['comparison_context']['shared_settings']
+    kinds = {legacy.learning_return_kind(entry['payload']) for entry in payload['runs']}
+    return_label = (legacy.learning_return_label(payload['runs'][0]['payload']) if len(kinds) == 1
+                    else 'Learning-objective return (see legend)' if 'legacy_team' not in kinds
+                    else 'Return (see objective labels in legend)')
     for ax, label in zip(training_axes, (
-            'Mean collected legacy-team return (gamma={:g})'.format(float(shared['gamma'])),
+            'Mean collected '+return_label.lower()+' (gamma={:g})'.format(float(shared['gamma'])),
             'Mean collected episode generation (TWh)')):
         ax.set(xlabel='Collected daily environment transitions', ylabel=label,
                title='{}-day stochastic training episodes (in-sample)'.format(shared['episode_horizon_days']))
-    evaluator_ax.set(ylabel='Legacy-team return (mean of three fixed training windows)',
-                     title='Evaluator Return vs. Evaluation Round')
+    evaluator_ax.set(ylabel=return_label+'\n(mean of three fixed training windows)',
+                     title=('Legacy Return' if kinds == {'legacy_team'} else 'Learning Return')+
+                         ' vs. Evaluation Round')
     for ax, title in zip(violation_axes, ('Ecological-flow violation rate',)):
         ax.set(ylabel='Violation rate (%)', title=title)
     for ax in (evaluator_ax, *violation_axes):

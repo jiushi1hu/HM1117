@@ -4,19 +4,132 @@ import json
 from contextlib import ExitStack
 from pathlib import Path
 import subprocess
+import sys
 
 from harl.envs.cascade_reservoir.episodes import episode_environment, positive_integer, training_windows
 from harl.envs.cascade_reservoir.periodic_evaluation import (
     PERIODIC_EVALUATION_DAYS, select_periodic_windows)
 from harl.envs.cascade_reservoir.training_metrics import log_episode, StepMetricsWriter, STEP_METRIC_FIELDS
 from harl.envs.cascade_reservoir.training_sampler import TrainingWindowSampler, validate_sampling_mode
+from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
+from harl.envs.cascade_reservoir.evaluation import episode_constraint_status
 from harl.envs.cascade_reservoir.trajectory_diagnostics import (
     TrajectoryDiagnosticsWriter, TRAJECTORY_DIAGNOSTIC_FIELDS)
 from harl.runners.cascade_reservoir_runner import (
     CascadeReservoirRunner, value_normalization_update_schedule)
-from harl.envs.cascade_reservoir.cascade_reservoir_env import actor_observation_features
+from harl.envs.cascade_reservoir.cascade_reservoir_env import (
+    ACTOR_OBSERVATION_LAYOUT, CRITIC_STATE_LAYOUT,
+    actor_observation_features, critic_state_size)
 
 ROOT=Path(__file__).resolve().parents[1]
+CORRECTNESS_FIGURES = ('mass_balance', 'water_levels', 'release_feasibility',
+                       'terminal_storage', 'reward_reconciliation', 'happo_updates')
+
+
+def validate_correctness_output(directory, other_paths=()):
+    """Reserve a new evidence directory without colliding with other outputs."""
+    if directory is None:
+        return
+    directory = Path(directory).resolve()
+    if directory.exists():
+        raise ValueError('correctness-output must name a new directory: '+str(directory))
+    for path in other_paths:
+        path = Path(path).resolve()
+        if path == directory or directory in path.parents or path in directory.parents:
+            raise ValueError('correctness-output must be separate from other experiment outputs')
+
+
+def build_correctness_payload(runners, metadata, evaluations, evaluation_failure=None):
+    """Retain final-policy physical evidence and all update-level HAPPO checks."""
+    runs = []
+    enabled = bool(metadata['physical_config'].get('terminal_storage_equal_initial', False))
+    for runner in runners:
+        terminal_records = []
+        def terminal_record(row, phase, scenario_id, policy_update=None):
+            terminal = row.get('terminal_objective')
+            completed = bool(row.get('completed', True)) and row.get('status') not in (
+                'failed', 'not_evaluated', 'unavailable')
+            available = enabled and completed and isinstance(terminal, dict)
+            physical = row.get('physical_feasible',
+                               bool(completed and not row.get('hard_constraint_failed', False)))
+            record = dict(phase=phase, scenario_id=scenario_id,
+                policy_update=runner.update_count if policy_update is None else policy_update,
+                source_years=row.get('source_years', []),
+                enabled=enabled, available=available,
+                status='ok' if completed else row.get('status', 'unavailable'))
+            record.update(episode_constraint_status(completed=completed, physical_feasible=physical,
+                terminal_enabled=enabled, terminal_objective=terminal,
+                service_shortfalls=row.get('service_shortfalls')))
+            if available:
+                record.update({name:terminal[name] for name in
+                    ('target_m3', 'final_storage_m3', 'deviation_m3', 'tolerance_m3', 'met')})
+                # Use the saved raw endpoints as a separate terminal reference;
+                # retain the simulator's report so disagreements stay auditable.
+                deviation = [float(end)-float(target) for end, target in
+                             zip(terminal['final_storage_m3'], terminal['target_m3'])]
+                tolerance = [max(1e-3, 1e-10*abs(float(target))) for target in terminal['target_m3']]
+                record.update(reported_deviation_m3=terminal['deviation_m3'],
+                    reported_tolerance_m3=terminal['tolerance_m3'], reported_met=terminal['met'],
+                    deviation_m3=deviation, tolerance_m3=tolerance,
+                    met=all(abs(error) <= bound for error, bound in zip(deviation, tolerance)),
+                    report_max_abs_error_m3=max(abs(float(actual)-expected) for actual, expected in
+                                                zip(terminal['deviation_m3'], deviation)))
+                record['reported_status_consistent'] = record['met'] == record['reported_met']
+                record.update(episode_constraint_status(completed=completed, physical_feasible=physical,
+                    terminal_enabled=enabled, terminal_objective={'met':record['met']},
+                    service_shortfalls=row.get('service_shortfalls')))
+            terminal_records.append(record)
+        for row in runner.episode_history:
+            terminal_record(row, 'training', 'collection_episode_'+str(row['episode']),
+                            row['policy_updates_completed'])
+        for periodic in runner.periodic_evaluation_history:
+            for window in periodic['windows']:
+                terminal_record(window, 'training_evaluation', window['window_id'],
+                                periodic['evaluation_round'])
+        for row in evaluations:
+            if row['seed'] == runner.seed:
+                terminal_record(row, 'evaluation', 'held_out_sequence')
+        if evaluation_failure is not None and not any(row['seed'] == runner.seed for row in evaluations):
+            terminal_record(dict(source_years=list(runner.data.evaluation_years),
+                                 completed=False, status='not_evaluated'),
+                            'evaluation', 'held_out_sequence')
+            terminal_records[-1]['status'] = ('failed' if runner.seed == evaluation_failure['seed']
+                                             else 'not_evaluated')
+        runs.append(dict(seed=runner.seed, trajectory=runner.correctness_trajectory,
+            terminal_records=terminal_records,
+            terminal_summary={phase:dict(record_count=len(rows),
+                completed_count=sum(row['completed'] for row in rows),
+                enabled_count=sum(row['enabled'] for row in rows),
+                measured_count=sum(row['available'] for row in rows),
+                terminal_pass_count=sum(row.get('terminal_met') is True for row in rows),
+                terminal_miss_count=sum(row.get('terminal_met') is False for row in rows),
+                required_pass_count=sum(row.get('required_constraints_met') is True for row in rows))
+                for phase in ('training', 'training_evaluation', 'evaluation')
+                for rows in [[row for row in terminal_records if row['phase'] == phase]]},
+            update_records=runner.correctness_update_history))
+    return dict(schema='cascade_correctness_v1', configuration=metadata, runs=runs,
+        evaluation_failure=evaluation_failure,
+        interpretation='Independent numerical consistency checks of the recorded implementation; '
+            'not a proof of hydraulic calibration, optimality or terminal feasibility',
+        trajectory_scope='deterministic final-policy median training-only evaluation scenario per seed',
+        terminal_scope='all collected episodes, every periodic evaluation round including round zero, and optional held-out sequence; compact endpoints only',
+        update_scope='all training updates; bounded summaries, no additional optimizer steps')
+
+
+def save_correctness_outputs(runners, metadata, evaluations, directory, plot_python,
+                             evaluation_failure=None):
+    """Save evidence before rendering so a plot failure cannot erase the data."""
+    evidence = build_correctness_payload(runners, metadata, evaluations, evaluation_failure)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    evidence_path = directory/'evidence.json'
+    with evidence_path.open('x', encoding='utf-8') as evidence_stream:
+        json.dump(evidence, evidence_stream, allow_nan=False, separators=(',', ':'))
+    subprocess.run([plot_python,str(ROOT/'examples/plot_cascade_correctness.py'),
+        '--input',str(evidence_path),'--output-dir',str(directory),'--no-show'],check=True,
+        stdout=None if metadata.get('config', {}).get('experiment', {}).get('verbose_console', False)
+                    else subprocess.DEVNULL)
+    print('Correctness evidence and six figures saved to '+str(directory.resolve()),flush=True)
 
 
 def step_metrics_paths(episode_log, seeds):
@@ -72,10 +185,17 @@ def check_episode_inputs(data,physical,years,days,bins):
 
 def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReservoirRunner,
                             algorithm_name=None):
+    verbose_console = config['experiment'].get('verbose_console', False)
+    if not isinstance(verbose_console, bool):
+        raise ValueError('verbose_console must be a boolean')
     if algorithm_name is not None:
         if not isinstance(algorithm_name,str) or algorithm_name.lower() not in ('happo','mappo'):
             raise ValueError('algorithm_name must be happo or mappo')
         algorithm_name=algorithm_name.lower()
+    correctness_dir = getattr(args, 'correctness_output', None)
+    correctness_enabled = correctness_dir is not None
+    if correctness_enabled and getattr(runner_cls, 'algorithm_name', 'happo') != 'happo':
+        raise ValueError('The six correctness figures require HAPPO; select --algorithms happo')
     days=positive_integer(config['train']['episode_length'],'episode_days')
     count=positive_integer(config['train']['n_rollout_threads'],'parallel_envs')
     episodes=positive_integer(config['experiment']['episodes'],'episodes')
@@ -113,6 +233,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     output_paths=(([] if args.episode_log is None else [args.episode_log])+
                   list(daily_paths.values())+list(figure_paths.values())+
                   list(trajectory_paths.values())+list(checkpoint_dirs.values())+list(credit_paths.values()))
+    validate_correctness_output(correctness_dir, output_paths)
     if len({path.resolve() for path in output_paths}) != len(output_paths):
         raise ValueError('Experiment output paths must be distinct')
     for path in output_paths:
@@ -148,12 +269,16 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                        else 'per_reservoir_over_common_rollout_rows'
                        if config['algo'].get('normalize_shared_advantages',False)
                        else 'per_reservoir_over_controllable_rows'))
-    raw_observation_dim=len(actor_observation_features(physical.get('use_daily_level_limits',False)))
+    daily_limits=physical.get('use_daily_level_limits',True)
+    raw_observation_dim=len(actor_observation_features(daily_limits))
     actor_architecture=dict(parameter_sharing=sharing,network_count=1 if sharing else 5,
         optimizer_count=1 if sharing else 5,raw_observation_dim=raw_observation_dim,
         network_observation_dim=raw_observation_dim+(5 if sharing else 0),
         identity_features='one_hot_reservoir_id' if sharing else 'implicit_in_separate_actor',
-        critic_output_dim=1 if team_advantage else 6)
+        critic_output_dim=1 if team_advantage else 6,
+        actor_observation_layout=ACTOR_OBSERVATION_LAYOUT,
+        critic_state_layout=CRITIC_STATE_LAYOUT,
+        critic_state_size=critic_state_size(daily_limits))
     comparison_context=json.loads(json.dumps(dict(shared_settings=dict(
         episode_horizon_days=days,parallel_environments=count,episodes_per_seed=episodes,
         gamma=config['algo']['gamma'],action_bins=bins,seeds=config['experiment']['seeds'],
@@ -178,7 +303,8 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             actor_objective_reduction='mean over all rollout rows; policy active masks zero forced rows',
             actor_discount_scope='gamma remains in GAE, Monte Carlo returns and reward accounting; '
                 'no additional gamma**t multiplier on policy or entropy objectives',
-            legacy_metrics='existing reward, CSV metrics and plot curves retain their team-reward definitions',
+            legacy_metrics='existing reward and compact CSV metrics retain legacy team-reward definitions; '
+                'return plots follow the declared learning objective',
             update_interpretation='individual-objective sequential clipped surrogates with original likelihood factors; '
                 'the common-return HAPPO improvement guarantee is not asserted for system accounting'),
         episode_horizon_days=days,parallel_environments=count,collector_backend='spawn worker processes',
@@ -218,9 +344,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             schedule='final completed update and every N updates if interval is positive',
             purpose='deterministic evaluation replay; training resume is not implemented'),
         calendar='fixed consecutive daily steps with leap days retained; storage carries across source-year boundaries',
-        release_bounds_scope=('episode_terminal_reachability' if physical.get(
+        release_bounds_scope=('cascade_prefix_seasonal_reserve_v2' if physical.get(
             'terminal_storage_equal_initial', False) else 'current_transition'),
-        terminal_storage_requirement=('each reservoir equals its episode-start storage after the final decision only'
+        terminal_storage_requirement=('episode-start equality is checked after the final decision; dispatcher reserve feasibility and physical completion are reported separately'
             if physical.get('terminal_storage_equal_initial', False) else 'disabled'),
         daily_bound_alignment='action_date=t constrains the state after action t; no additional date shift',
         step_logging=dict(enabled=args.episode_log is not None,
@@ -244,6 +370,13 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     metadata['comparison_context']=comparison_context
     metadata['actor_architecture']=actor_architecture
     metadata['learning_objective']=learning_objective
+    if correctness_enabled:
+        metadata['correctness_diagnostics'] = dict(enabled=True,
+            output_directory=str(Path(correctness_dir).resolve()),
+            evidence_file='evidence.json', figures=[name+'.png' for name in CORRECTNESS_FIGURES],
+            physical_scope='one final-policy deterministic median training window per seed',
+            update_scope='all HAPPO updates; independent float64 prefix-likelihood checks',
+            terminal_scope='all collected episode endpoints, all periodic rounds including round zero, and optional held-out sequence')
     if credit_mode == 'counterfactual':
         learning_objective.update(advantage_source='counterfactual_shared_team',
             normalization='common_controllable_rms_without_centering')
@@ -275,13 +408,19 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             'one shared actor trained on pooled reservoir samples and individual mixed-return '
             'clipped PPO surrogates with a centralized critic; '
             'system reward remains an accounting metric rather than the actor training target')
-    print(json.dumps(metadata,indent=2,allow_nan=False),flush=True)
+    if verbose_console:
+        print(json.dumps(metadata,indent=2,allow_nan=False),flush=True)
     if args.check_data_only:
         print('Data, episode calendar and observation checks passed; '
               'future trajectory feasibility is not certified. No workers or training started.',flush=True)
         return
+    if correctness_enabled:
+        subprocess.run([args.plot_python,str(ROOT/'examples/plot_cascade_correctness.py'),
+                        '--check-backend'],check=True,
+                       stdout=None if verbose_console else subprocess.DEVNULL)
     if not args.no_plot:
-        subprocess.run([args.plot_python,str(ROOT/'examples/plot_cascade.py'),'--check-backend'],check=True)
+        subprocess.run([args.plot_python,str(ROOT/'examples/plot_cascade.py'),'--check-backend'],check=True,
+                       stdout=None if verbose_console else subprocess.DEVNULL)
     with ExitStack() as outputs:
         stream=None
         daily_writers={}
@@ -298,10 +437,12 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                 from harl.envs.cascade_reservoir.counterfactual_logging import CounterfactualCreditWriter
                 credit_writers={seed:outputs.enter_context(CounterfactualCreditWriter(path))
                                 for seed,path in credit_paths.items()}
-        log_episode(metadata,stream)
+        log_episode(metadata,stream,console=verbose_console)
         runners=[]
         for seed in config['experiment']['seeds']:
             credit_options={'counterfactual_log':credit_writers[seed]} if seed in credit_writers else {}
+            if correctness_enabled:
+                credit_options['correctness_enabled'] = True
             runner=runner_cls(data,physical,config,seed,episode_log=stream,
                                           step_log=daily_writers.get(seed),periodic_windows=periodic_windows,
                                           training_sampler=training_samplers[seed],
@@ -309,7 +450,22 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                                           checkpoint_dir=checkpoint_dirs.get(seed), **credit_options)
             runner.run(episodes,interval)
             runners.append(runner)
-        evaluations=[] if args.skip_final_evaluation else [row for runner in runners for row in runner.final_evaluation()]
+        evaluations=[]
+        if not args.skip_final_evaluation:
+            try:
+                for runner in runners:
+                    evaluations.extend(runner.final_evaluation())
+            except InfeasibleCascade as exc:
+                if correctness_enabled:
+                    failure = dict(seed=runner.seed, reason=str(exc),
+                        progress=getattr(exc, 'evaluation_progress', {}))
+                    try:
+                        save_correctness_outputs(runners, metadata, evaluations, correctness_dir,
+                                                 args.plot_python, failure)
+                    except (OSError, ValueError, subprocess.CalledProcessError) as output_error:
+                        print('Correctness output failed after evaluation failure: '+str(output_error),
+                              file=sys.stderr)
+                raise
         result=dict(record_type='run_complete',seeds=config['experiment']['seeds'],
             episode_horizon_days=days,parallel_environments=count,episodes_per_seed=episodes,
             training_steps_per_seed=[runner.training_steps for runner in runners],
@@ -323,7 +479,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             policy_checkpoints=[checkpoint for runner in runners for checkpoint in runner.checkpoint_history],
             evaluation_skipped=bool(args.skip_final_evaluation),evaluations=evaluations,
             learning_objective=learning_objective)
-        log_episode(result,stream)
+        log_episode(result,stream,console=verbose_console)
+        if correctness_enabled:
+            save_correctness_outputs(runners, metadata, evaluations, correctness_dir, args.plot_python)
         payload=json.loads(json.dumps(dict(episode_horizon_days=days,gamma=config['algo']['gamma'],
             seeds=config['experiment']['seeds'],updates_per_seed=episodes//count,
             periodic_evaluation=dict(windows=periodic_windows),
@@ -338,9 +496,14 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                                      '--evaluator-output',str(figure_paths['evaluator']),
                                      '--violations-output',str(figure_paths['violations'])])
             subprocess.run(plot_command,
-                input=json.dumps(payload,allow_nan=False),text=True,check=True)
-    print('Finished multi-year experiment. Training resume is not implemented; '
-          'evaluation checkpoints are saved when --save-checkpoints is enabled. '
-          'JSONL summaries and per-seed daily metrics CSVs are saved with --episode-log. '
-          'Figures are saved with --plot-output or --episode-log when plotting is enabled.',flush=True)
+                input=json.dumps(payload,allow_nan=False),text=True,check=True,
+                stdout=None if verbose_console else subprocess.DEVNULL)
+    if verbose_console:
+        print('Finished multi-year experiment. Training resume is not implemented; '
+              'evaluation checkpoints are saved when --save-checkpoints is enabled. '
+              'JSONL summaries and per-seed daily metrics CSVs are saved with --episode-log. '
+              'Figures are saved with --plot-output or --episode-log when plotting is enabled.',flush=True)
+    else:
+        print('Finished multi-year experiment.' + (' Summaries: '+str(args.episode_log.resolve())
+              if args.episode_log is not None else ''), flush=True)
     return payload

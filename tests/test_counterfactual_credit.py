@@ -4,6 +4,7 @@ from pathlib import Path
 import random
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -28,7 +29,9 @@ def value_function(states):
     # Explicit row reductions keep this analytical reference independent of
     # BLAS's batch-size-dependent float32 matrix-multiply accumulation order.
     return ((states[:, :5]*np.arange(1., 6., dtype=np.float32)).sum(axis=1)+
-            3.*states[:, 10:15].sum(axis=1)+states[:, -1]).reshape(-1, 1)
+            3.*states[:, 10:15].sum(axis=1)+
+            (states[:, :5]*(.5*states[:, -15:-10]+2.*states[:, -10:-5]+
+                           4.*states[:, -5:])).sum(axis=1)).reshape(-1, 1)
 
 
 class CounterfactualCreditTest(unittest.TestCase):
@@ -63,6 +66,8 @@ class CounterfactualCreditTest(unittest.TestCase):
                     [row['terminal_remaining_days'] for row in day] for day in records])
                 context['terminal_forecast'] = np.asarray([
                     [row['terminal_forecast'] for row in day] for day in records])
+                context['terminal_future_external_volume_m3'] = np.asarray([
+                    [row['terminal_future_external_volume_m3'] for row in day] for day in records])
             probabilities = np.stack([np.roll(np.arange(1.,6.), i) for i in range(5)])
             probabilities = np.broadcast_to(probabilities/15., (3,2,5,5)).copy()
             masks = np.ones((3,2,1)); masks[-1] = 0.
@@ -94,7 +99,8 @@ class CounterfactualCreditTest(unittest.TestCase):
                                 if row.get('terminal_target') is not None:
                                     terminal = dict(target=row['terminal_target'],
                                         remaining_days=row['terminal_remaining_days'],
-                                        forecast=row['terminal_forecast'])
+                                        forecast=row['terminal_forecast'],
+                                        future_external_volume_m3=row['terminal_future_external_volume_m3'])
                                 transition = fixture['env'].physics.transition(row['storage_start'],
                                     row['external'], actions, row['storage_lower_m3'], row['storage_upper_m3'],
                                     terminal=terminal)
@@ -152,6 +158,33 @@ class CounterfactualCreditTest(unittest.TestCase):
         terminal = self.compute(fixture, critic=forbidden, continuation_masks=np.zeros((3,2,1)))
         np.testing.assert_array_equal(first['q_values'], terminal['q_values'])
 
+    def test_candidate_states_preserve_next_date_forecasts_and_episode_targets(self):
+        original = self.fixtures['fixed']
+        for width in (33, 53):
+            with self.subTest(state_size=width):
+                fixture = dict(original)
+                states = original['next_states']
+                if width == 33:
+                    states = np.concatenate([states[..., :18], states[..., -15:]], axis=-1)
+                fixture['next_states'] = states
+                batches = []
+                def predict(candidate):
+                    batches.append(candidate.copy())
+                    return value_function(candidate)
+                self.compute(fixture, critic=predict)
+                candidates = np.concatenate(batches)
+                templates = np.repeat(states[:-1].reshape(-1, width), 5*5, axis=0)
+                self.assertEqual(candidates.shape, templates.shape)
+                np.testing.assert_array_equal(candidates[:, 5:10], templates[:, 5:10])
+                np.testing.assert_array_equal(candidates[:, 15:], templates[:, 15:])
+                self.assertTrue(np.any(candidates[:, :5] != templates[:, :5]))
+
+    def test_legacy_states_without_dispatch_context_are_rejected(self):
+        fixture = self.fixtures['fixed']
+        for width in (18, 28, 38, 48):
+            with self.subTest(state_size=width), self.assertRaisesRegex(ValueError, '33/53'):
+                self.compute(fixture, next_states=fixture['next_states'][..., :width])
+
     def test_forced_choices_are_zero_credit_and_keep_original_sampled_commands(self):
         fixture = self.fixtures['fixed']; env = fixture['env']
         storage = env.data.initial_storage(1965)
@@ -159,12 +192,81 @@ class CounterfactualCreditTest(unittest.TestCase):
         context = dict(storage_start=storage[None,None], external=external[None,None],
             actions=np.array([[[4,3,2,1,0]]]), storage_lower=storage[None,None],
             storage_upper=storage[None,None], controls=np.zeros((1,1,5)))
-        result = self.compute(fixture, context=context, next_states=np.zeros((1,1,38)),
+        result = self.compute(fixture, context=context, next_states=np.zeros((1,1,53)),
             policy_probabilities=np.full((1,1,5,5), .2), continuation_masks=np.zeros((1,1,1)))
         np.testing.assert_array_equal(result['raw_advantages'], np.zeros((1,1,5)))
         np.testing.assert_array_equal(result['normalized_advantages'], np.zeros((1,1,5)))
         np.testing.assert_allclose(np.ptp(result['q_values'], axis=-1), 0., atol=1e-12)
         self.assertEqual(result['summary']['controllable_rows'], 0)
+
+    def test_future_external_volume_is_replayed_for_every_counterfactual_chunk(self):
+        from harl.envs.cascade_reservoir.batched_physics import batched_transition
+        fixture = self.fixtures['fixed']
+        observed = []
+        def dispatch(*args, **kwargs):
+            observed.append(kwargs['terminal']['future_external_volume_m3'].copy())
+            return batched_transition(*args, **kwargs)
+        with mock.patch('harl.envs.cascade_reservoir.counterfactual_credit.batched_transition',
+                        side_effect=dispatch):
+            self.compute(fixture, batch=7)
+        expected = np.repeat(fixture['context']['terminal_future_external_volume_m3'].reshape(-1, 5),
+                             5*5, axis=0)
+        np.testing.assert_array_equal(np.concatenate(observed), expected)
+        self.assertLessEqual(max(len(batch) for batch in observed), 7)
+
+    def test_future_volume_requires_valid_complete_terminal_context(self):
+        fixture = self.fixtures['fixed']
+        for value in (np.full((3, 2, 5), -1.), np.full((3, 2, 5), np.nan), np.zeros((3, 2, 4))):
+            with self.subTest(shape=value.shape):
+                context = copy.deepcopy(fixture['context'])
+                context['terminal_future_external_volume_m3'] = value
+                with self.assertRaisesRegex(ValueError, 'volume'):
+                    self.compute(fixture, context=context)
+        context = copy.deepcopy(fixture['context'])
+        for name in ('terminal_target', 'terminal_remaining_days', 'terminal_forecast'):
+            context.pop(name)
+        with self.assertRaisesRegex(ValueError, 'complete terminal context'):
+            self.compute(fixture, context=context)
+
+    def test_selected_command_q_matches_rejected_nonfinal_and_forced_final_dispatch(self):
+        for head, fixture in self.fixtures.items():
+            env, data = fixture['env'], fixture['env'].data
+            storage = .5*(data.vmin+data.vmax)
+            target = storage.copy()
+            target[0] += 100.*env.physics.dt
+            commands = np.array([4, 3, 2, 1, 0])
+            for days in (2, 1):
+                with self.subTest(head=head, days=days):
+                    terminal = dict(target=target, remaining_days=days, forecast=np.zeros(5),
+                                    future_external_volume_m3=np.zeros(5))
+                    actual = env.physics.transition(storage, np.zeros(5), commands/4., terminal=terminal)
+                    env.operation_reward.apply(actual)
+                    self.assertTrue(actual['terminal_plan_rejected'])
+                    self.assertEqual(actual['terminal_fallback'], days == 1)
+                    context = dict(storage_start=storage[None, None], external=np.zeros((1, 1, 5)),
+                        actions=commands[None, None], storage_lower=data.vmin[None, None],
+                        storage_upper=data.vmax[None, None], controls=actual['controls'][None, None],
+                        terminal_target=target[None, None], terminal_remaining_days=np.array([[days]]),
+                        terminal_forecast=np.zeros((1, 1, 5)),
+                        terminal_future_external_volume_m3=np.zeros((1, 1, 5)))
+                    state = np.zeros(53, dtype=np.float32)
+                    state[:5] = (actual['storage_end']-data.vmin)/(data.vmax-data.vmin)
+                    state[10:15] = actual['release']/data.release_cap
+                    state[-10:-5] = (target-data.vmin)/(data.vmax-data.vmin)
+                    mask = np.array([[[float(days > 1)]]])
+                    result = self.compute(fixture, context=context, next_states=state[None, None],
+                        policy_probabilities=np.full((1, 1, 5, 5), .2), continuation_masks=mask)
+                    actual_q = actual['system_reward']
+                    if days > 1:
+                        actual_q += .995*float(value_function(state[None])[0, 0])
+                    np.testing.assert_allclose(result['q_actual'], actual_q, rtol=1e-7, atol=2e-6)
+                    if days == 1:
+                        np.testing.assert_array_equal(actual['controls'], np.zeros(5))
+                        np.testing.assert_allclose(np.ptp(result['q_values'], axis=-1), 0., atol=1e-12)
+                        np.testing.assert_array_equal(result['normalized_advantages'], np.zeros((1, 1, 5)))
+                    else:
+                        self.assertTrue(actual['controls'].any())
+                        self.assertGreater(float(np.ptp(result['q_values'], axis=-1).max()), 0.)
 
     def test_common_rms_preserves_sign_and_excludes_forced_rows(self):
         raw = np.array([[[-2., 1., 4., 1000., 0.]]]); controls = np.array([[[1.,1.,1.,0.,1.]]])

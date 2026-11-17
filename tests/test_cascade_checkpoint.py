@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 from harl.envs.cascade_reservoir.checkpoint import (
     REPLAY_TRACE_FIELDS, ReplayTraceWriter, load_checkpoint, save_checkpoint, _digest, _state_hash)
 from harl.envs.cascade_reservoir.data_loader import CascadeData, IDS
+from harl.envs.cascade_reservoir.cascade_reservoir_env import ACTOR_OBSERVATION_LAYOUT, CRITIC_STATE_LAYOUT
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.periodic_evaluation import select_periodic_windows
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
@@ -83,6 +84,10 @@ class CascadeCheckpointTest(unittest.TestCase):
         self.assertEqual(policy.critic_reward_layout, self.runner.critic_reward_layout)
         self.assertEqual(policy.actor_value_channels, self.runner.actor_value_channels)
         self.assertEqual(policy.metadata['actor_value_channels'], list(self.runner.actor_value_channels))
+        self.assertEqual(policy.metadata['observation']['actor_observation_layout'], ACTOR_OBSERVATION_LAYOUT)
+        self.assertEqual(policy.metadata['observation']['critic_state_layout'], CRITIC_STATE_LAYOUT)
+        self.assertEqual(policy.metadata['observation']['actor_observation_size'], 18)
+        self.assertEqual(policy.metadata['observation']['critic_state_size'], 53)
         state = self.runner.envs[0].state()
         with torch.no_grad():
             self.assertEqual(tuple(policy.critic(state[None]).shape), (1, self.runner.critic_output_dim))
@@ -282,6 +287,27 @@ class CascadeCheckpointTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_checkpoint(self.path)
 
+    def test_forecast_and_target_observation_layout_cannot_be_mislabeled(self):
+        save_checkpoint(self.runner, self.path)
+        original = self.payload()
+        changes = (dict(actor_observation_layout='local_neighbors_next_day_limits_next7d_forecast_v3'),
+                   dict(actor_observation_size=16), dict(critic_state_layout='unknown'),
+                   dict(critic_state_size=38))
+        for change in changes:
+            with self.subTest(change=change):
+                stored = copy.deepcopy(original)
+                stored['metadata']['observation'].update(change)
+                stored['metadata_sha256'] = _digest(stored['metadata'])
+                torch.save(stored, self.path)
+                with self.assertRaisesRegex(ValueError, 'observation layout'):
+                    load_checkpoint(self.path)
+        stored = copy.deepcopy(original)
+        del stored['metadata']['observation']['critic_state_layout']
+        stored['metadata_sha256'] = _digest(stored['metadata'])
+        torch.save(stored, self.path)
+        with self.assertRaisesRegex(ValueError, 'observation layout'):
+            load_checkpoint(self.path)
+
     def test_relocated_data_must_match_and_no_normalizer_mode(self):
         save_checkpoint(self.runner, self.path)
         relocated = Path(self.tmp.name)/'data'
@@ -325,8 +351,8 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
         self.assertEqual(len(stored['metadata']['model_hashes']['actors']), 1)
         self.assertTrue(stored['metadata']['actor_parameter_sharing'])
         self.assertEqual(stored['metadata']['agent_ids'], list(range(5)))
-        self.assertEqual(stored['metadata']['raw_actor_observation_dim'], 16)
-        self.assertEqual(stored['metadata']['actor_observation_dim'], 21)
+        self.assertEqual(stored['metadata']['raw_actor_observation_dim'], 18)
+        self.assertEqual(stored['metadata']['actor_observation_dim'], 23)
         before = torch.get_rng_state().clone()
         numpy_before, random_before = np.random.get_state(), random.getstate()
         frozen = load_checkpoint(self.path)
@@ -339,7 +365,7 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
         self.assertFalse(hasattr(frozen.actors[0].core, 'actor_optimizer'))
         first_linear = next(module for module in frozen.actors[0].actor.modules()
                             if isinstance(module, torch.nn.Linear))
-        self.assertEqual(first_linear.in_features, 21)
+        self.assertEqual(first_linear.in_features, 23)
         observation = self.runner.envs[0].actor_observations()[0:1]
         for original, view in zip(self.runner.actor, frozen.actors):
             with torch.no_grad():
